@@ -418,6 +418,108 @@ function MirrorStage({
 
 /* ── 组件 ── */
 
+/** 实例列表（纯展示，便于带数据渲染测试）。 */
+export function InstanceList({
+  instances,
+  activeId,
+  onSelect,
+}: {
+  instances: InstanceSnapshot[]
+  activeId: string | undefined
+  onSelect: (id: string) => void
+}): ReactNode {
+  if (instances.length === 0) {
+    return (
+      <div className="drd-meta">
+        还没有配置实例。在 profile 的 <span className="drd-mono">cordis.patch.yml</span> 里给
+        <span className="drd-mono"> remote-desks </span>加上 <span className="drd-mono">instances</span> 即可。
+      </div>
+    )
+  }
+  return (
+    <>
+      {instances.map((instance) => (
+        <button
+          key={instance.id}
+          type="button"
+          className="drd-item"
+          data-active={activeId === instance.id}
+          onClick={() => onSelect(instance.id)}
+        >
+          <span className="drd-item-top">
+            <span className="drd-dot" data-phase={instance.phase} />
+            <span className="drd-name">{instance.label}</span>
+          </span>
+          <span className="drd-meta">
+            {instance.kind === 'local' ? '本机' : instance.kind === 'wsl' ? 'WSL' : 'SSH'} · {phaseText(instance)}
+          </span>
+        </button>
+      ))}
+    </>
+  )
+}
+
+/** 实例工具栏（纯展示）：预检 / 启动 / 重启 / 停止 / 浏览器打开。 */
+export function InstanceToolbar({
+  instance,
+  busy,
+  mirrorEntryUrl,
+  onAction,
+  onCheck,
+}: {
+  instance: InstanceSnapshot
+  busy: string | undefined
+  mirrorEntryUrl: string | undefined
+  onAction: (id: string, action: 'start' | 'stop' | 'restart') => void
+  onCheck: (id: string) => void
+}): ReactNode {
+  return (
+    <div className="drd-toolbar">
+      <strong>{instance.label}</strong>
+      <span className="drd-meta">{instance.detail}</span>
+      <div className="drd-spacer" />
+      <button type="button" className="drd-btn" disabled={busy !== undefined} onClick={() => onCheck(instance.id)}>
+        预检
+      </button>
+      <button
+        type="button"
+        className="drd-btn"
+        disabled={instance.phase === 'running' || busy !== undefined}
+        onClick={() => onAction(instance.id, 'start')}
+      >
+        启动
+      </button>
+      <button
+        type="button"
+        className="drd-btn"
+        disabled={instance.phase === 'stopped' || busy !== undefined}
+        onClick={() => onAction(instance.id, 'restart')}
+      >
+        重启
+      </button>
+      <button
+        type="button"
+        className="drd-btn"
+        disabled={instance.phase === 'stopped' || busy !== undefined}
+        onClick={() => onAction(instance.id, 'stop')}
+      >
+        停止
+      </button>
+      <button
+        type="button"
+        className="drd-btn"
+        disabled={mirrorEntryUrl === undefined}
+        onClick={() => {
+          if (mirrorEntryUrl !== undefined) window.open(mirrorEntryUrl, '_blank', 'noopener')
+        }}
+        title="用系统浏览器打开镜像地址"
+      >
+        浏览器打开
+      </button>
+    </div>
+  )
+}
+
 function phaseText(instance: InstanceSnapshot): string {
   if (instance.phase === 'running') return instance.remotePort === undefined ? '运行中' : `运行中 · 远端 ${String(instance.remotePort)}`
   if (instance.phase === 'starting') return '启动中'
@@ -464,30 +566,7 @@ function Panel(props: PanelServices): ReactNode {
 
       <div className="drd-body">
         <div className="drd-list">
-          {instances.length === 0 ? (
-            <div className="drd-meta">
-              还没有配置实例。在 profile 的 <span className="drd-mono">cordis.patch.yml</span> 里给
-              <span className="drd-mono"> remote-desks </span>加上 <span className="drd-mono">instances</span> 即可。
-            </div>
-          ) : (
-            instances.map((instance) => (
-              <button
-                key={instance.id}
-                type="button"
-                className="drd-item"
-                data-active={active?.id === instance.id}
-                onClick={() => setSelected(instance.id)}
-              >
-                <span className="drd-item-top">
-                  <span className="drd-dot" data-phase={instance.phase} />
-                  <span className="drd-name">{instance.label}</span>
-                </span>
-                <span className="drd-meta">
-                  {instance.kind === 'local' ? '本机' : instance.kind === 'wsl' ? 'WSL' : 'SSH'} · {phaseText(instance)}
-                </span>
-              </button>
-            ))
-          )}
+          <InstanceList instances={instances} activeId={active?.id} onSelect={setSelected} />
         </div>
 
         <div className="drd-main">
@@ -495,67 +574,26 @@ function Panel(props: PanelServices): ReactNode {
             <div className="drd-placeholder">左侧还没有实例。</div>
           ) : (
             <>
-              <div className="drd-toolbar">
-                <strong>{active.label}</strong>
-                <span className="drd-meta">{active.detail}</span>
-                <div className="drd-spacer" />
-                <button
-                  type="button"
-                  className="drd-btn"
-                  disabled={busy !== undefined}
-                  onClick={() => {
-                    setChecks({ phase: 'loading' })
-                    fetch(`${INSTANCES_URL}/${encodeURIComponent(active.id)}/check`, {
-                      headers: { accept: 'application/json' },
+              <InstanceToolbar
+                instance={active}
+                busy={busy}
+                mirrorEntryUrl={open}
+                onAction={(id, action) => void run(id, action)}
+                onCheck={(id) => {
+                  setChecks({ phase: 'loading' })
+                  fetch(`${INSTANCES_URL}/${encodeURIComponent(id)}/check`, {
+                    headers: { accept: 'application/json' },
+                  })
+                    .then(async (response) => {
+                      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+                      const body = (await response.json()) as { checks?: PreflightItem[] }
+                      setChecks({ phase: 'ready', items: body.checks ?? [] })
                     })
-                      .then(async (response) => {
-                        if (!response.ok) throw new Error(`HTTP ${response.status}`)
-                        const body = (await response.json()) as { checks?: PreflightItem[] }
-                        setChecks({ phase: 'ready', items: body.checks ?? [] })
-                      })
-                      .catch((error: unknown) =>
-                        setChecks({ phase: 'error', message: error instanceof Error ? error.message : String(error) }),
-                      )
-                  }}
-                >
-                  预检
-                </button>
-                <button
-                  type="button"
-                  className="drd-btn"
-                  disabled={active.phase === 'running' || busy !== undefined}
-                  onClick={() => void run(active.id, 'start')}
-                >
-                  启动
-                </button>
-                <button
-                  type="button"
-                  className="drd-btn"
-                  disabled={active.phase === 'stopped' || busy !== undefined}
-                  onClick={() => void run(active.id, 'restart')}
-                >
-                  重启
-                </button>
-                <button
-                  type="button"
-                  className="drd-btn"
-                  disabled={active.phase === 'stopped' || busy !== undefined}
-                  onClick={() => void run(active.id, 'stop')}
-                >
-                  停止
-                </button>
-                <button
-                  type="button"
-                  className="drd-btn"
-                  disabled={open === undefined}
-                  onClick={() => {
-                    if (open !== undefined) window.open(open, '_blank', 'noopener')
-                  }}
-                  title="用系统浏览器打开镜像地址"
-                >
-                  浏览器打开
-                </button>
-              </div>
+                    .catch((error: unknown) =>
+                      setChecks({ phase: 'error', message: error instanceof Error ? error.message : String(error) }),
+                    )
+                }}
+              />
 
               {checks === undefined ? null : <CheckList state={checks} onClose={() => setChecks(undefined)} />}
 

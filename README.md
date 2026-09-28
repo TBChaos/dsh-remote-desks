@@ -280,9 +280,10 @@ cordis.patch.yml        bundle patch（安装时并入 profile）
 
 自动化能证明的都证明了；剩下这几条要么需要人眼，要么需要真实环境，写在这里免得误以为都覆盖了：
 
-1. **面板与镜像容器的交互渲染**：`pnpm smoke` 用 `react-dom/server` 把面板、侧栏图标、设置页
-   真的渲染了一遍（渲染期崩了就是白屏，这一类已经覆盖），但 SSR 不跑 effect——**带数据的状态、
-   webview/iframe 的实际显示**仍需要有头环境。需要你重启桌面应用看一次。
+1. **面板与镜像容器的交互渲染**：`pnpm smoke` 用 `react-dom/server` 把面板、实例列表、工具栏、
+   侧栏图标、设置页都真的渲染了一遍——包括**带数据**的列表（运行中/已停止、状态点、端口、
+   按钮禁用态）与空列表指引。渲染期崩溃、内容缺失这一类已覆盖；**SSR 不跑 effect**，
+   所以带数据的状态、webview/iframe 的实际显示仍需要有头环境。需要你重启桌面应用看一次。
 2. **真实 sshd 的互操作**：SSH 腿用仓库自带的测试对端（ssh2 Server，真实 SSH 协议）验证，
    覆盖了连接、密码认证、exec、`direct-tcpip`、隧道换 cookie、镜像往返。**没覆盖**的是各家
    sshd 的特有行为：`keyboard-interactive`、`ProxyJump` 在服务端的配置差异、以及主机密钥

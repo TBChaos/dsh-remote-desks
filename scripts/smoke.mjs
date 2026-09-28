@@ -545,6 +545,90 @@ const icon = byName('sidebar.panellist')
 const settings = byName('settings.section')
 check('渲染前拿到三个组件', panel !== undefined && icon !== undefined && settings !== undefined)
 
+// 带数据的实例列表与工具栏：这是用户点完启动会看到的那一屏。
+const listComponent = realExports.InstanceList
+const toolbarComponent = realExports.InstanceToolbar
+check('导出了 InstanceList / InstanceToolbar', typeof listComponent === 'function' && typeof toolbarComponent === 'function')
+
+const fixtureRunning = {
+  id: 'local-dev',
+  kind: 'local',
+  label: '本机（内置运行时）',
+  enabled: true,
+  phase: 'running',
+  detail: '运行中，远端端口 52478',
+  remotePort: 52478,
+  mirrorEntryUrl: 'http://127.0.0.1:19500/?k=ticket',
+  logs: { nextOffset: 0, lines: [] },
+}
+const fixtureStopped = {
+  id: 'wsl-ubuntu',
+  kind: 'wsl',
+  label: 'WSL · Ubuntu-24.04',
+  enabled: true,
+  phase: 'stopped',
+  detail: '未启动',
+  logs: { nextOffset: 0, lines: [] },
+}
+
+try {
+  const listHtml = renderToStaticMarkup(
+    React.createElement(listComponent, {
+      instances: [fixtureRunning, fixtureStopped],
+      activeId: 'local-dev',
+      onSelect: () => {},
+    }),
+  )
+  check('列表渲染出两个实例', listHtml.includes('本机（内置运行时）') && listHtml.includes('WSL · Ubuntu-24.04'))
+  check('列表标出选中项', listHtml.includes('data-active="true"'))
+  check('运行中的实例显示远端端口', listHtml.includes('远端 52478'), listHtml.slice(0, 200))
+  check('停止的实例显示未启动', listHtml.includes('未启动'))
+  check('列表带状态点', listHtml.includes('data-phase="running"') && listHtml.includes('data-phase="stopped"'))
+  check('列表标出实例类型', listHtml.includes('本机') && listHtml.includes('WSL'))
+} catch (error) {
+  check('列表渲染出两个实例', false, error instanceof Error ? error.message : String(error))
+}
+
+try {
+  const listEmpty = renderToStaticMarkup(
+    React.createElement(listComponent, { instances: [], activeId: undefined, onSelect: () => {} }),
+  )
+  check('空列表给出配置指引', listEmpty.includes('cordis.patch.yml'))
+
+  const runningToolbar = renderToStaticMarkup(
+    React.createElement(toolbarComponent, {
+      instance: fixtureRunning,
+      busy: undefined,
+      mirrorEntryUrl: fixtureRunning.mirrorEntryUrl,
+      onAction: () => {},
+      onCheck: () => {},
+    }),
+  )
+  check(
+    '工具栏四个动作齐全',
+    ['预检', '启动', '重启', '停止'].every((label) => runningToolbar.includes(label)),
+    runningToolbar.slice(0, 120),
+  )
+  check('运行中时「启动」禁用、可「浏览器打开」', (runningToolbar.match(/disabled=""/g) ?? []).length >= 1)
+
+  const stoppedToolbar = renderToStaticMarkup(
+    React.createElement(toolbarComponent, {
+      instance: fixtureStopped,
+      busy: undefined,
+      mirrorEntryUrl: undefined,
+      onAction: () => {},
+      onCheck: () => {},
+    }),
+  )
+  check(
+    '停止时按钮禁用数更多（停止/重启/浏览器打开）',
+    (stoppedToolbar.match(/disabled=""/g) ?? []).length > (runningToolbar.match(/disabled=""/g) ?? []).length,
+    `${String((stoppedToolbar.match(/disabled=""/g) ?? []).length)} vs ${String((runningToolbar.match(/disabled=""/g) ?? []).length)}`,
+  )
+} catch (error) {
+  check('空列表给出配置指引', false, error instanceof Error ? error.message : String(error))
+}
+
 try {
   const panelHtml = renderToStaticMarkup(React.createElement(panel, { layout: renderCtx.layout, rightbar: renderCtx.sidebarRight }))
   check('面板能渲染出 HTML', panelHtml.length > 100, `${String(panelHtml.length)} 字符`)
