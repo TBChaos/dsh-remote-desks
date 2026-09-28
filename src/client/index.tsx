@@ -741,12 +741,32 @@ function Panel(props: PanelServices): ReactNode {
     lines.push(`生成时间：${new Date().toISOString()}`)
     try {
       const state = (await (await fetch(STATE_URL)).json()) as Record<string, unknown>
+      const plugin = (state.plugin ?? {}) as Record<string, unknown>
       const host = (state.host ?? {}) as Record<string, unknown>
-      const cap = (state.capabilities ?? {}) as Record<string, unknown>
-      lines.push(`运行形态：${String(host.platform ?? '未知')}｜DSH 入口：${String(host.entry ?? '未知')}`)
-      lines.push(`运行入口来源：${String(cap.entrySource ?? '未知')}`)
-      const gate = (state.gate ?? {}) as Record<string, unknown>
-      lines.push(`控制接口闸门：${String(gate.mode ?? gate.description ?? JSON.stringify(gate))}`)
+      const runtime = (state.runtime ?? {}) as Record<string, unknown>
+      const control = (state.control ?? {}) as Record<string, unknown>
+      const services = (state.services ?? {}) as Record<string, boolean>
+      lines.push(
+        `插件：${String(plugin.displayName ?? plugin.name ?? '未知')} ${String(plugin.version ?? '')}` +
+          `${plugin.milestone === undefined ? '' : `｜里程碑 ${String(plugin.milestone)}`}`,
+      )
+      lines.push(
+        `运行形态：${String(host.platform ?? '未知')}/${String(host.arch ?? '')}` +
+          `｜Node ${String(host.node ?? '未知')}` +
+          `｜Electron ${host.electron === null || host.electron === undefined ? '否' : String(host.electron)}` +
+          `${host.dshProfile === null || host.dshProfile === undefined ? '' : `｜profile ${String(host.dshProfile)}`}`,
+      )
+      lines.push(
+        `DSH 运行时：${runtime.found === true ? '找到' : '未找到'}` +
+          `${runtime.version === undefined ? '' : `｜${String(runtime.version)}`}` +
+          `｜入口：${String(runtime.entry ?? '未知')}` +
+          `${runtime.entrySource === undefined ? '' : `（来源 ${String(runtime.entrySource)}）`}`,
+      )
+      lines.push(`控制接口：${String(control.prefix ?? '')}｜闸门：${String(control.gate ?? '未知')}`)
+      const missing = Object.entries(services)
+        .filter(([, ok]) => ok !== true)
+        .map(([key]) => key)
+      lines.push(`宿主服务：${String(Object.keys(services).length)} 项，缺 ${missing.length === 0 ? '无' : missing.join(', ')}`)
       lines.push(`容器偏好（openMode）：${preference}`)
       lines.push(`实例数：${String(instances.length)}`)
     } catch (error) {

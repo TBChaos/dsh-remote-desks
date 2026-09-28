@@ -16,7 +16,7 @@ export const inject = ['webServer']
 /** 展示名（中文优先）。 */
 export const displayName = '远端工作台'
 /** 当前里程碑，会出现在面板与状态接口里。 */
-export const milestone = 'M0 · 骨架与能力探测'
+export const milestone = 'M4 · 多实例并发 / 五种容器 / 更新与回滚'
 /** 控制接口挂载前缀。 */
 export const CONTROL_PREFIX = '/remote-desks'
 
