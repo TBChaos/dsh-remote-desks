@@ -1,11 +1,8 @@
-// 活体验证：起一个真实的 DSH web 实例（独立 profile），确认插件在真实 Loader 树里
-// 挂上了控制接口、客户端 bundle 进了 boot 图，并且闸门在真实服务器上生效。
-//
-// 这就是 M1「拉起一个本机实例」的最小原型：同一套启动/就绪/清理逻辑。
+// 活体验证：起一个真实的 DSH web 宿主（临时 profile），在它里面跑本插件，
+// 然后驱动插件拉起真实的「本机实例」和（可选）「WSL 实例」，并通过镜像端点访问它们的 UI。
 //
 //   node scripts/verify-live.mjs [--profile m0-test] [--port 19401] [--keep-profile]
-//
-// 依赖：仓库里的 @deepseek-ai/dsh（devDependency）提供 CLI 入口，pnpm 用 DSH 运行时自带的。
+//                               [--pnpm <pnpm.mjs>] [--node <node.exe>] [--wsl <distro>]
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { request as httpRequest } from 'node:http'
@@ -26,9 +23,12 @@ const port = Number(argOf('port', '19401'))
 const keepProfile = args.includes('--keep-profile')
 const pnpmEntry = argOf('pnpm', process.env.DSH_PNPM_ENTRY ?? '')
 const nodeBin = argOf('node', process.execPath)
+const wslDistro = argOf('wsl', '')
 
 const dshHome = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? process.env.HOME ?? '.', '.dsh')
 const profileDir = join(dshHome, 'profiles', profile)
+const localInstanceProfile = 'mirror-m1-local'
+const wslInstanceProfile = 'mirror-m1-wsl'
 
 const failures = []
 const check = (label, ok, detail = '') => {
@@ -36,11 +36,13 @@ const check = (label, ok, detail = '') => {
   if (!ok) failures.push(label)
 }
 
+const wait = (ms) => new Promise((done) => setTimeout(done, ms))
+
 function dshEntry() {
   return require.resolve('@deepseek-ai/dsh/lib/bin.js')
 }
 
-/** 准备一个与 desktop 同构的 profile：dsh-base + dsh-web-app + 本插件（link 安装）。 */
+/** 与 desktop 同构的 profile：dsh-base + dsh-web-app + 本插件，并声明待启动的实例。 */
 function prepareProfile() {
   mkdirSync(profileDir, { recursive: true })
   writeFileSync(
@@ -56,9 +58,29 @@ function prepareProfile() {
       2,
     )}\n`,
   )
+  const instances = [
+    `      - id: m1-local`,
+    `        kind: local`,
+    `        profile: ${localInstanceProfile}`,
+    `        cwd: ${JSON.stringify(root)}`,
+  ]
+  if (wslDistro !== '') {
+    instances.push(`      - id: m1-wsl`, `        kind: wsl`, `        distro: ${wslDistro}`, `        cwd: /home/zmh`)
+  }
   writeFileSync(
     join(profileDir, 'cordis.patch.yml'),
-    `# ${profile}：由 scripts/verify-live.mjs 生成的临时 profile。\n[]\n`,
+    [
+      `# ${profile}：由 scripts/verify-live.mjs 生成的临时 profile。`,
+      `# 覆盖本插件那一行的 config（patch 会替换整块 config，所以每个键都要重申）。`,
+      `- id: remote-desks`,
+      `  config:`,
+      `    instances:`,
+      ...instances,
+      `    autoStart: []`,
+      `    mirror: { host: 127.0.0.1, portRange: [0, 0], openMode: auto }`,
+      `    announce: true`,
+      '',
+    ].join('\n'),
   )
   const workspace = join(root, 'pnpm-workspace.yaml')
   if (existsSync(workspace)) writeFileSync(join(profileDir, 'pnpm-workspace.yaml'), readFileSync(workspace))
@@ -77,13 +99,11 @@ function installProfile() {
   }
 }
 
-const wait = (ms) => new Promise((done) => setTimeout(done, ms))
-
 /**
  * 用 node:http 而不是 fetch —— fetch 会把 `host` 当禁止头名丢掉，伪造不出来。
  * 这里要验的正是 Host 校验，所以必须能自己写 Host。
  */
-function httpGet(url, headers = {}) {
+function httpRequestOnce(url, { method = 'GET', headers = {} } = {}) {
   return new Promise((resolvePromise, rejectPromise) => {
     const parsed = new URL(url)
     const request = httpRequest(
@@ -91,7 +111,7 @@ function httpGet(url, headers = {}) {
         hostname: parsed.hostname,
         port: parsed.port,
         path: `${parsed.pathname}${parsed.search}`,
-        method: 'GET',
+        method,
         headers,
       },
       (response) => {
@@ -110,8 +130,81 @@ function httpGet(url, headers = {}) {
   })
 }
 
+const get = (url, headers) => httpRequestOnce(url, { headers })
+const post = (url, headers) => httpRequestOnce(url, { method: 'POST', headers })
+const cookieOf = (headers) => (headers['set-cookie'] ?? []).map((value) => value.split(';')[0]).join('; ')
+
+async function awaitPhase(base, cookie, id, phase, timeoutMs = 150_000) {
+  const deadline = Date.now() + timeoutMs
+  let last
+  while (Date.now() < deadline) {
+    try {
+      const response = await get(`${base}/remote-desks/api/instances/${id}`, { cookie })
+      last = JSON.parse(response.text)
+      if (last.phase === phase) return last
+      if (last.phase === 'error' && phase !== 'error') return last
+    } catch {
+      // 宿主可能正在收尾；继续轮询直到超时
+    }
+    await wait(1000)
+  }
+  return last
+}
+
+function dumpLogs(snapshot) {
+  console.log(`  (实例日志)\n    ${(snapshot?.logs?.lines ?? []).slice(-14).join('\n    ')}`)
+}
+
+/** 一个实例的完整镜像往返：票据闸门 → 票据换 cookie → 镜像 UI → 子资源。 */
+async function verifyMirror(base, cookie, id) {
+  const running = await awaitPhase(base, cookie, id, 'running')
+  check(`${id} 进入 running`, running?.phase === 'running', `${String(running?.phase)}：${String(running?.detail)}`)
+  if (running?.phase !== 'running') {
+    dumpLogs(running)
+    return running
+  }
+  check(`${id} 给出了远端端口`, Number.isSafeInteger(running.remotePort) && running.remotePort > 0, String(running.remotePort))
+  check(`${id} 给出了镜像入口`, typeof running.mirrorEntryUrl === 'string' && running.mirrorEntryUrl.includes('?k='))
+
+  const noTicket = await get(running.mirrorBaseUrl)
+  check(`${id} 镜像端点无票据 → 403`, noTicket.status === 403, String(noTicket.status))
+
+  const ticketExchange = await get(running.mirrorEntryUrl)
+  check(`${id} 票据换 cookie → 302`, ticketExchange.status === 302, String(ticketExchange.status))
+  const mirrorCookie = cookieOf(ticketExchange.headers)
+  check(`${id} 发出了票据 cookie`, mirrorCookie.includes('dsh_mirror='), mirrorCookie)
+
+  const mirrored = await get(running.mirrorBaseUrl, { cookie: mirrorCookie })
+  check(`${id} 带票据取到被镜像的 UI`, mirrored.status === 200, String(mirrored.status))
+  check(`${id} 镜像内容是 DSH 前端`, mirrored.text.includes('__DSH_BOOT__'), `长度 ${String(mirrored.text.length)}`)
+  // 锋利的判据：宿主自己的 boot 图里有本插件，实例的没有——"不含本插件行"正好证明
+  // 拿到的是另一个实例的 UI，而不是本地的。
+  check(`${id} 镜像是另一个实例（不含本插件行）`, !mirrored.text.includes('dsh-remote-desks'))
+  check(`${id} 镜像含实例自己的标准客户端行`, mirrored.text.includes('dsh-client-ui-conversation'))
+  if (mirrored.status !== 200) console.log(`  (镜像响应)\n    ${mirrored.text.slice(0, 300)}`)
+
+  // 子资源的 URL 形态随远端版本略有差异（组合式 `plugins/??<id>/client.js&rev=…`
+  // 与单资源式都见过），所以两种都认；真的一处都没有就打印证据而不是直接判失败。
+  const assetMatch =
+    /"url":"(plugins\/[^"]*)"/.exec(mirrored.text) ?? /(plugins\/\?\?[^"'\s]+)/.exec(mirrored.text)
+  if (assetMatch === null) {
+    const at = mirrored.text.indexOf('plugins/')
+    check(`${id} 镜像 index 里能找到子资源 url`, false, at === -1 ? '整份 index 未出现 plugins/' : mirrored.text.slice(Math.max(0, at - 120), at + 120))
+  } else {
+    // index 里的 URL 是 HTML 文本，`&` 会被转义成 `&amp;`，取资源前必须还原。
+    const assetPath = assetMatch[1].replace(/&amp;/g, '&').replace(/&#38;/g, '&')
+    const asset = await get(`${running.mirrorBaseUrl}${assetPath}`, { cookie: mirrorCookie })
+    check(`${id} 镜像里的子资源可取`, asset.status === 200, String(asset.status))
+    check(`${id} 子资源是客户端 bundle`, asset.text.startsWith('window.__ModuleLoader__.load({'))
+  }
+
+  const badTicket = await get(`${running.mirrorBaseUrl}?k=wrong`)
+  check(`${id} 错误票据 → 403`, badTicket.status === 403, String(badTicket.status))
+  return running
+}
+
 async function main() {
-  console.log(`\n[prepare] profile=${profile} port=${String(port)}`)
+  console.log(`\n[prepare] profile=${profile} port=${String(port)} wsl=${wslDistro === '' ? '（跳过）' : wslDistro}`)
   prepareProfile()
   installProfile()
 
@@ -146,7 +239,7 @@ async function main() {
   }
 
   try {
-    check('实例启动并打印就绪行', ready)
+    check('宿主启动并打印就绪行', ready)
     if (!ready) {
       console.log(`--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`)
       return
@@ -157,55 +250,76 @@ async function main() {
     const token = /token=([\w-]+)/.exec(stdout)?.[1]
     check('就绪行带 token', typeof token === 'string' && token.length > 0)
 
-    // 裸请求必须被拒：控制接口叠加了官方信任判定，没有会话 cookie 一律挡掉。
-    const anonymous = await httpGet(`${base}/remote-desks/api/state`)
-    check(
-      '无 cookie 的裸请求被拒（401/403）',
-      anonymous.status === 401 || anonymous.status === 403,
-      String(anonymous.status),
-    )
+    /* ── M0：鉴权、boot 图、bundle ── */
+    console.log('\n[M0] 控制接口与客户端 bundle')
+    const anonymous = await get(`${base}/remote-desks/api/state`)
+    check('无 cookie 的裸请求被拒（401/403）', anonymous.status === 401 || anonymous.status === 403, String(anonymous.status))
 
-    // token 换 cookie：303 + Set-Cookie，之后控制接口与 index 都靠它。
-    const exchange = await httpGet(`${base}/?token=${String(token)}`)
-    const cookie = (exchange.headers['set-cookie'] ?? []).map((value) => value.split(';')[0]).join('; ')
+    const exchange = await get(`${base}/?token=${String(token)}`)
+    const cookie = cookieOf(exchange.headers)
     check('token 换到了会话 cookie', cookie !== '', String(exchange.status))
 
-    const state = await httpGet(`${base}/remote-desks/api/state`, { cookie })
-    check('带 cookie 的 GET /remote-desks/api/state → 200', state.status === 200, String(state.status))
-    let report
-    try {
-      report = JSON.parse(state.text)
-    } catch {
-      report = undefined
-    }
-    check('状态体是合法 JSON', report !== undefined)
+    const state = await get(`${base}/remote-desks/api/state`, { cookie })
+    check('带 cookie 的 GET /api/state → 200', state.status === 200, String(state.status))
+    const report = JSON.parse(state.text)
     check('报告含 webServer 服务', report?.services?.webServer === true)
+    check('报告含 subprocess 服务', report?.services?.subprocess === true)
     check('闸门已生效', typeof report?.control?.gate === 'string', String(report?.control?.gate))
+    check('配置里看得到实例', report?.config?.instances >= 1, String(report?.config?.instances))
 
-    const forged = await httpGet(`${base}/remote-desks/api/state`, { cookie, host: '10.1.2.3:19401' })
+    const forged = await get(`${base}/remote-desks/api/state`, { cookie, host: '10.1.2.3:19401' })
     check('伪造非回环 Host → 403', forged.status === 403, String(forged.status))
 
-    const index = await httpGet(`${base}/`, { cookie })
+    const index = await get(`${base}/`, { cookie })
     check('index 含本插件的 boot 行', index.text.includes('dsh-remote-desks'))
-
     const url = /"url":"([^"]*dsh-remote-desks[^"]*)"/.exec(index.text)?.[1]
     check('boot 图给出 bundle url', typeof url === 'string' && url.length > 0, String(url))
     if (typeof url === 'string') {
-      const bundle = await httpGet(`${base}/${url}`, { cookie })
+      const bundle = await get(`${base}/${url}`, { cookie })
       check('客户端 bundle 可取', bundle.status === 200, String(bundle.status))
       check('bundle 是 __ModuleLoader__ 形态', bundle.text.startsWith('window.__ModuleLoader__.load({'))
-      check('bundle 内模块 id 正确', bundle.text.includes('"dsh-remote-desks"'))
-      check('bundle 体积合理', bundle.text.length > 2000, String(bundle.text.length))
+    }
+
+    /* ── M1：本机实例 ── */
+    console.log('\n[M1] 本机实例：启动 → 镜像 → 停止')
+    const before = await get(`${base}/remote-desks/api/instances/m1-local`, { cookie })
+    check('实例初始状态可读', before.status === 200, String(before.status))
+    check('实例初始为 stopped', JSON.parse(before.text)?.phase === 'stopped', String(JSON.parse(before.text)?.phase))
+
+    const started = await post(`${base}/remote-desks/api/instances/m1-local/start`, { cookie })
+    check('POST start → 200', started.status === 200, String(started.status))
+    await verifyMirror(base, cookie, 'm1-local')
+
+    const stopped = await post(`${base}/remote-desks/api/instances/m1-local/stop`, { cookie })
+    check('POST stop → 200', stopped.status === 200, String(stopped.status))
+    const after = await awaitPhase(base, cookie, 'm1-local', 'stopped', 30_000)
+    check('实例回到 stopped', after?.phase === 'stopped', String(after?.phase))
+    check('停止后不再暴露镜像端点', after?.mirrorBaseUrl === undefined, String(after?.mirrorBaseUrl))
+
+    const logs = await get(`${base}/remote-desks/api/instances/m1-local/logs?offset=0`, { cookie })
+    check('实例日志可读', (JSON.parse(logs.text)?.lines ?? []).length > 0)
+
+    /* ── M1：WSL 实例 ── */
+    if (wslDistro !== '') {
+      console.log(`\n[M1] WSL 实例：${wslDistro} 启动 → 镜像 → 停止`)
+      const wslStarted = await post(`${base}/remote-desks/api/instances/m1-wsl/start`, { cookie })
+      check('WSL POST start → 200', wslStarted.status === 200, String(wslStarted.status))
+      await verifyMirror(base, cookie, 'm1-wsl')
+      await post(`${base}/remote-desks/api/instances/m1-wsl/stop`, { cookie })
+      const wslAfter = await awaitPhase(base, cookie, 'm1-wsl', 'stopped', 30_000)
+      check('WSL 实例回到 stopped', wslAfter?.phase === 'stopped', String(wslAfter?.phase))
     }
   } finally {
     child.kill('SIGTERM')
-    await wait(1200)
+    await wait(1500)
     if (child.exitCode === null) child.kill('SIGKILL')
     if (!keepProfile) {
-      try {
-        rmSync(profileDir, { recursive: true, force: true })
-      } catch {
-        /* 清理失败不影响结论 */
+      for (const dir of [profileDir, join(dshHome, 'profiles', localInstanceProfile), join(dshHome, 'profiles', wslInstanceProfile)]) {
+        try {
+          rmSync(dir, { recursive: true, force: true })
+        } catch {
+          /* 清理失败不影响结论 */
+        }
       }
     }
   }

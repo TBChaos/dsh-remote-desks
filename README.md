@@ -6,7 +6,8 @@
 镜像出来的界面就是 DSH 自己的前端（随远端版本走），桌面窗口的外壳、主题、侧栏与快捷键
 全部复用当前应用，不另造一套 UI。
 
-> **状态：M0 完成并已验证。** 面板、控制接口、构建链路与三道验证齐备；实例管理在 M1 接入。
+> **状态：M0 完成；M1 宿主侧完成并已验证（本机 + WSL 两条腿）。** 实例监管器、镜像代理、
+> 控制接口都能跑了；**客户端面板还停留在 M0 的占位**，实例列表/标签切换/镜像区尚未接。
 > 里程碑与已核实的技术约束见 [里程碑与范围](#里程碑与范围)。
 
 ## 它解决什么
@@ -69,12 +70,14 @@ dsh plugin --profile desktop add <本目录路径>
 
 ## 控制接口
 
-M0 只提供两个只读端点，供面板与排障使用：
-
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/remote-desks/api/state` | 能力矩阵 + 配置摘要 |
 | `GET` | `/remote-desks/api/ping` | 存活探测 |
+| `GET` | `/remote-desks/api/instances` | 全部实例的运行时快照 |
+| `GET` | `/remote-desks/api/instances/:id` | 单个实例快照（含 `phase` / 镜像地址 / 退出码） |
+| `GET` | `/remote-desks/api/instances/:id/logs?offset=N` | 增量拉日志（行号偏移，环形缓冲 600 行） |
+| `POST` | `/remote-desks/api/instances/:id/start\|stop\|restart` | 生命周期操作 |
 
 **两道闸门叠加**，缺一不可：
 
@@ -84,6 +87,34 @@ M0 只提供两个只读端点，供面板与排障使用：
 控制接口能启停进程，所以第二层不是多余的。判定的结果会写在 `/api/state` 的 `control.gate` 里。
 因此：**裸 curl（没有会话 cookie）拿到 401，伪造非回环 Host 拿到 403**，桌面版与纯 Web 版
 （都带 host 自己发的会话 cookie）才拿得到 200。
+
+## 镜像端点
+
+每个**运行中**的实例独占一个只监听回环的 HTTP 端口，把远端实例的 UI 原样搬到
+`http://127.0.0.1:<port>/`，HTTP / WebSocket / SSE 都转发。为什么不做成本地 DSH 的一条子路径：
+
+1. 桌面端 Electron guest 明确禁止访问与宿主同端口的回环地址（`isApplicationHost`），挂在 19387 上会被直接拦掉；
+2. 同源会让远端实例的脚本能拿着你的 cookie 调本地 `/api`（confused deputy），独立端口天然做掉源隔离。
+
+访问需要票据：首次打开 `?k=<ticket>` 换成 cookie，之后所有子请求与 WS 握手都靠它；
+无票据或票据错误一律 403。转发时会把 `host` / `origin` 改写成远端自己的 authority、
+注入启动时换好的远端会话 cookie，并剥掉 `content-security-policy` / `x-frame-options`
+（否则嵌不进来）与逐跳头，同时把 `set-cookie` 归一成属于镜像 origin 的形态。
+
+## WSL 的三条硬约束（都实测过）
+
+写 WSL 启动命令时踩到的坑，已固化在默认命令里：
+
+1. **必须单行**：多行命令在 Windows → WSL 这一跳会丢换行；
+2. **不能有变量赋值**：`P=...`、`export P=...`、`declare P=...` 都会被 wsl.exe 当环境变量赋值吃掉
+   （所以路径一律内联 `$HOME`）；
+3. **不含双引号**：JSON 用 base64 传进去，把引号一起消掉。
+
+另外两个环境事实：发行版里的 node 常常只配在 `~/.bashrc`（nvm），登录 shell 不加载，所以默认命令
+会显式 source `~/.nvm/nvm.sh`；WSL 里绑 `127.0.0.1` 的端口能否被 Windows 直连取决于网络模式
+（镜像网络可以，默认 NAT 不行），监管器会**先探测再决定**，不通就给出明确诊断而不是留一个连不上的镜像。
+
+> 想用自己的启动方式？把 `launchCommand` 写进实例配置即可，但上面三条约束同样适用。
 
 ## 开发
 

@@ -1,9 +1,13 @@
 import { createRequire } from 'node:module'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
-import { buildCapabilityReport, type CapabilityReport } from './capabilities.js'
+import { buildCapabilityReport, probeDshRuntime, type CapabilityReport } from './capabilities.js'
 import { Config, type RemoteDesksConfig } from './config.js'
-import { createControlHandler, loopbackOriginGuard } from './control/routes.js'
+import { createControlHandler, loopbackOriginGuard, type ControlApi } from './control/routes.js'
+import { InstanceSupervisor } from './instances/supervisor.js'
+import type { InstanceSnapshot, LocalRuntime } from './instances/types.js'
 
 /** 插件包名，同时也是客户端 bundle 的模块 id。 */
 export const name = 'dsh-remote-desks'
@@ -101,8 +105,8 @@ function createGuard(ctx: RemoteDesksHostContext): {
 /**
  * 插件入口。
  *
- * M0 只做三件事：探测宿主能力、把控制接口挂到本地 web server、把报告暴露给客户端面板。
- * 不启动任何进程，也不改动任何配置。
+ * 装配三件事：宿主能力探测、控制接口（挂在本地 web server 上）、实例监管器。
+ * 空配置下不启动任何进程；只有 config.instances 里声明且被 start 的实例才会跑起来。
  */
 export function apply(ctx: RemoteDesksHostContext, config: RemoteDesksConfig): void {
   const { guard, describeGate } = createGuard(ctx)
@@ -119,11 +123,36 @@ export function apply(ctx: RemoteDesksHostContext, config: RemoteDesksConfig): v
       config,
     })
 
-  const handler = createControlHandler({
-    prefix: CONTROL_PREFIX,
+  const dshHome = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  const subprocess = (): ReturnType<typeof asSubprocess> => asSubprocess(ctx.get('subprocess'))
+
+  const supervisor = new InstanceSupervisor(
+    { instances: config.instances },
+    {
+      dshHome,
+      localRuntime: (): LocalRuntime | undefined => {
+        const runtime = probeDshRuntime()
+        if (!runtime.found || runtime.entry === undefined) return undefined
+        return { entry: runtime.entry, execPath: process.execPath, electron: process.versions.electron !== undefined }
+      },
+      log: (message) => ctx.logger?.info?.(message),
+    },
+    subprocess,
+  )
+
+  ctx.effect(() => () => void supervisor.dispose(), 'dsh-remote-desks: instance supervisor')
+
+  const api: ControlApi = {
     state: () => report(),
-    guard,
-  })
+    instances: () => supervisor.list(),
+    instance: (id) => supervisor.snapshot(id),
+    start: (id) => supervisor.start(id),
+    stop: (id) => supervisor.stop(id),
+    restart: (id) => supervisor.restart(id),
+    logs: (id, offset) => supervisor.logs(id, offset),
+  }
+
+  const handler = createControlHandler({ prefix: CONTROL_PREFIX, guard, api })
 
   ctx.effect(
     () => ctx.webServer.register({ kind: 'prefix', path: CONTROL_PREFIX, handler }),
@@ -138,7 +167,49 @@ export function apply(ctx: RemoteDesksHostContext, config: RemoteDesksConfig): v
     ctx.logger?.info?.(
       `[${name}] ${displayName} ${version} 已就绪（${milestone}）｜控制接口 ${CONTROL_PREFIX}/api/state` +
         `｜DSH 发行版 ${snapshot.runtime.found ? snapshot.runtime.version ?? '未知' : '未解析到'}` +
+        `｜实例 ${String(snapshot.config.instances)} 个（启用 ${String(snapshot.config.enabledInstances)}，自动启动 ${String(snapshot.config.autoStart)}）` +
         `｜缺失服务 ${missing.length === 0 ? '无' : missing.join(', ')}`,
     )
   }
+
+  // 自动启动：不阻塞启动流程，失败只记日志——面板里能看到每个实例的真实状态。
+  if (config.autoStart.length > 0) {
+    void (async () => {
+      for (const id of config.autoStart) {
+        try {
+          await supervisor.start(id)
+        } catch (error) {
+          ctx.logger?.warn?.(
+            `[${name}] 自动启动实例 ${id} 失败：${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+      }
+    })()
+  }
 }
+
+/** 从 ctx.get('subprocess') 取出可用的子进程服务；形状不对就当作没有。 */
+function asSubprocess(value: unknown): {
+  spawn(spec: {
+    argv: readonly string[]
+    cwd: string
+    stdio: { stdin: 'ignore'; stdout: { maxBytes: number }; stderr: { maxBytes: number } }
+    graceMs: number
+    env?: NodeJS.ProcessEnv
+  }): {
+    done: Promise<{ exitCode: number | null; signal: string | null }>
+    terminate(): void
+    waitForExit(signal?: AbortSignal): Promise<boolean>
+    collected: {
+      stdout?: { readFrom(offset: number): { text: string; nextOffset: number; lossy: boolean } }
+      stderr?: { readFrom(offset: number): { text: string; nextOffset: number; lossy: boolean } }
+    }
+  }
+} | undefined {
+  if (value === null || typeof value !== 'object') return undefined
+  const spawn = (value as { spawn?: unknown }).spawn
+  if (typeof spawn !== 'function') return undefined
+  return value as never
+}
+
+export type { InstanceSnapshot }

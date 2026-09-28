@@ -282,6 +282,127 @@ check('注册了 main 面板 key', mainPanel?.key === 'remote-desks', String(mai
 check('sidebar 入口带中文标签', typeof panelEntry?.label === 'function' && panelEntry.label() === '远端工作台')
 check('注册总数=3', registered.length === 3, `实际 ${registered.length}`)
 
+/* ── 4. 头重写规则（纯函数，最易悄悄回归） ── */
+
+console.log('\n[4] 镜像代理的头重写')
+const rewrite = await import(pathToFileURL(resolve(root, 'lib/mirror/rewrite.js')).href)
+
+const requestHeaders = rewrite.rewriteRequestHeaders(
+  {
+    host: '127.0.0.1:52480',
+    origin: 'http://127.0.0.1:52480',
+    cookie: 'dsh_mirror=abc; other=1',
+    'sec-fetch-site': 'same-origin',
+    'sec-fetch-mode': 'navigate',
+    connection: 'keep-alive',
+    'accept-encoding': 'gzip',
+    'user-agent': 'test',
+  },
+  '127.0.0.1:52478',
+  'dsh-auth-xyz=v1.token',
+)
+check('请求 host 改写为上游', requestHeaders.host === '127.0.0.1:52478', String(requestHeaders.host))
+check('请求 origin 改写为上游', requestHeaders.origin === 'http://127.0.0.1:52478', String(requestHeaders.origin))
+check('注入远端 cookie（不泄漏票据）', requestHeaders.cookie === 'dsh-auth-xyz=v1.token', String(requestHeaders.cookie))
+check('剥离 sec-fetch-*', requestHeaders['sec-fetch-site'] === undefined && requestHeaders['sec-fetch-mode'] === undefined)
+check('逐跳头被剥掉', requestHeaders.connection === 'close', String(requestHeaders.connection))
+check('普通头保留', requestHeaders['accept-encoding'] === 'gzip' && requestHeaders['user-agent'] === 'test')
+
+const wsHeaders = rewrite.rewriteRequestHeaders(
+  { host: 'x', upgrade: 'websocket', connection: 'Upgrade', 'sec-websocket-key': 'k', 'sec-websocket-version': '13' },
+  '127.0.0.1:1',
+  undefined,
+  { websocket: true },
+)
+check('WebSocket 保留 upgrade', wsHeaders.upgrade === 'websocket', String(wsHeaders.upgrade))
+check('WebSocket connection 为 Upgrade', wsHeaders.connection === 'Upgrade', String(wsHeaders.connection))
+check('WebSocket 保留 sec-websocket-*', wsHeaders['sec-websocket-key'] === 'k')
+
+const responseHeaders = rewrite.rewriteResponseHeaders({
+  'content-type': 'text/html',
+  'content-security-policy': "default-src 'self'",
+  'x-frame-options': 'DENY',
+  'cache-control': 'no-store',
+  'set-cookie': ['dsh-auth-abc=v1.zzz; Path=/; HttpOnly; SameSite=Strict', 'extra=1; Domain=example.com; Secure'],
+  connection: 'keep-alive',
+})
+check('剥离 CSP', responseHeaders['content-security-policy'] === undefined)
+check('剥离 X-Frame-Options', responseHeaders['x-frame-options'] === undefined)
+check('保留 content-type', responseHeaders['content-type'] === 'text/html')
+check('剥离逐跳响应头', responseHeaders.connection === undefined)
+const cookies = responseHeaders['set-cookie']
+check('响应保留两条 cookie', Array.isArray(cookies) && cookies.length === 2, JSON.stringify(cookies))
+check('cookie 去掉 Domain', cookies?.[1]?.includes('Domain') === false, String(cookies?.[1]))
+check('cookie 去掉 Secure', cookies?.[1]?.includes('Secure') === false, String(cookies?.[1]))
+check('cookie Path 归一为 /', cookies?.[0]?.includes('Path=/') === true, String(cookies?.[0]))
+
+check('cookieHeaderFrom 拼装', rewrite.cookieHeaderFrom(['a=1; Path=/', 'b=2']) === 'a=1; b=2')
+check('cookieHeaderFrom 空值', rewrite.cookieHeaderFrom(undefined) === undefined)
+const ready = rewrite.parseReadyUrl('http://127.0.0.1:52478/?token=abc_DEF')
+check('parseReadyUrl 取端口', ready?.port === 52478, String(ready?.port))
+check('parseReadyUrl 取 token', ready?.token === 'abc_DEF', String(ready?.token))
+check('parseReadyUrl 拒绝坏 URL', rewrite.parseReadyUrl('not-a-url') === undefined)
+check('upstreamAuthority 固定回环', rewrite.upstreamAuthority(52478) === '127.0.0.1:52478')
+
+/* ── 5. 实例控制接口 ── */
+
+console.log('\n[5] 实例控制接口（真实 handler + 假 api）')
+const { createControlHandler } = await import(pathToFileURL(resolve(root, 'lib/control/routes.js')).href)
+const calls = []
+const handler5 = createControlHandler({
+  prefix: '/remote-desks',
+  guard: () => undefined,
+  api: {
+    state: () => ({ ok: true }),
+    instances: () => [{ id: 'a', phase: 'running' }],
+    instance: (id) => (id === 'a' ? { id, phase: 'running' } : undefined),
+    start: async (id) => {
+      calls.push(['start', id])
+      if (id === 'boom') throw new Error('实例 a 正在处理上一个操作')
+      return { id, phase: 'starting' }
+    },
+    stop: async (id) => {
+      calls.push(['stop', id])
+      return { id, phase: 'stopped' }
+    },
+    restart: async (id) => ({ id, phase: 'starting' }),
+    logs: (id, offset) => {
+      calls.push(['logs', id, offset])
+      return { nextOffset: 7, lines: [`line-${String(offset)}`] }
+    },
+  },
+})
+const call5 = (method, url) => {
+  const res = fakeResponse()
+  handler5({ method, url, headers: { host: '127.0.0.1:19387' } }, res)
+  return res
+}
+const post5 = async (url) => {
+  const res = fakeResponse()
+  handler5({ method: 'POST', url, headers: { host: '127.0.0.1:19387' } }, res)
+  await new Promise((done) => setTimeout(done, 20))
+  return res
+}
+
+check('GET /api/instances → 200', call5('GET', '/remote-desks/api/instances').statusCode === 200)
+check(
+  '实例列表带 instances',
+  JSON.parse(call5('GET', '/remote-desks/api/instances').body)?.instances?.[0]?.id === 'a',
+)
+check('GET 已知实例 → 200', call5('GET', '/remote-desks/api/instances/a').statusCode === 200)
+check('GET 未知实例 → 404', call5('GET', '/remote-desks/api/instances/zzz').statusCode === 404)
+check('logs 透传 offset', (() => {
+  call5('GET', '/remote-desks/api/instances/a/logs?offset=5')
+  return calls.some((entry) => entry[0] === 'logs' && entry[2] === 5)
+})())
+const startedRes = await post5('/remote-desks/api/instances/a/start')
+check('POST start → 200', startedRes.statusCode === 200, String(startedRes.statusCode))
+check('start 落到 api', calls.some((entry) => entry[0] === 'start' && entry[1] === 'a'))
+const conflict = await post5('/remote-desks/api/instances/boom/start')
+check('POST start 冲突 → 409', conflict.statusCode === 409, String(conflict.statusCode))
+check('未知动作 → 404', call5('POST', '/remote-desks/api/instances/a/explode').statusCode === 404)
+check('GET 方法打 start → 404', call5('GET', '/remote-desks/api/instances/a/start').statusCode === 404)
+
 /* ── 汇总 ── */
 
 console.log('')

@@ -1,12 +1,22 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
-/** 控制接口的挂载前缀（相对本地 DSH web server 的根）。 */
+/** 控制接口对外暴露的操作面；由 index.ts 用监管器实现。 */
+export interface ControlApi {
+  state(): unknown
+  instances(): unknown
+  instance(id: string): unknown
+  start(id: string): Promise<unknown>
+  stop(id: string): Promise<unknown>
+  restart(id: string): Promise<unknown>
+  logs(id: string, offset: number): unknown
+}
+
 export interface ControlRouteOptions {
+  /** 控制接口的挂载前缀（相对本地 DSH web server 的根）。 */
   prefix: string
-  /** 返回当前状态快照；M0 只提供能力矩阵与实例计数。 */
-  state: () => unknown
   /** 返回 401/403 表示拒绝该请求；undefined 表示放行。 */
   guard: (req: IncomingMessage) => number | undefined
+  api: ControlApi
 }
 
 const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1', '[::1]'])
@@ -54,6 +64,13 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(text)
 }
 
+/** `/remote-desks` 之后的部分，去掉尾斜杠。 */
+function routeOf(pathname: string, prefix: string): string {
+  const rest = pathname.slice(prefix.length)
+  if (rest === '' || rest === '/') return '/'
+  return rest.endsWith('/') ? rest.slice(0, -1) : rest
+}
+
 export function createControlHandler(options: ControlRouteOptions) {
   return (req: IncomingMessage, res: ServerResponse): void => {
     const rejection = options.guard(req)
@@ -66,23 +83,67 @@ export function createControlHandler(options: ControlRouteOptions) {
     }
 
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
-    const rest = url.pathname.slice(options.prefix.length)
-    const route = rest === '' ? '/' : rest
+    const route = routeOf(url.pathname, options.prefix)
+    const method = req.method ?? 'GET'
 
-    if (req.method === 'GET' && (route === '/api/state' || route === '/api/state/')) {
-      sendJson(res, 200, options.state())
+    if (method === 'GET' && route === '/api/state') {
+      sendJson(res, 200, options.api.state())
+      return
+    }
+    if (method === 'GET' && route === '/api/ping') {
+      sendJson(res, 200, { ok: true, at: new Date().toISOString() })
+      return
+    }
+    if (method === 'GET' && route === '/api/instances') {
+      sendJson(res, 200, { instances: options.api.instances() })
       return
     }
 
-    if (req.method === 'GET' && (route === '/api/ping' || route === '/api/ping/')) {
-      sendJson(res, 200, { ok: true, at: new Date().toISOString() })
+    const single = /^\/api\/instances\/([^/]+)$/.exec(route)
+    if (method === 'GET' && single !== null) {
+      const snapshot = options.api.instance(decodeURIComponent(single[1] ?? ''))
+      if (snapshot === undefined) {
+        sendJson(res, 404, { error: 'not-found', id: single[1] })
+        return
+      }
+      sendJson(res, 200, snapshot)
+      return
+    }
+
+    const logs = /^\/api\/instances\/([^/]+)\/logs$/.exec(route)
+    if (method === 'GET' && logs !== null) {
+      const offset = Number(url.searchParams.get('offset') ?? '0')
+      const view = options.api.logs(
+        decodeURIComponent(logs[1] ?? ''),
+        Number.isSafeInteger(offset) && offset >= 0 ? offset : 0,
+      )
+      if (view === undefined) {
+        sendJson(res, 404, { error: 'not-found', id: logs[1] })
+        return
+      }
+      sendJson(res, 200, view)
+      return
+    }
+
+    const action = /^\/api\/instances\/([^/]+)\/(start|stop|restart)$/.exec(route)
+    if (method === 'POST' && action !== null) {
+      const id = decodeURIComponent(action[1] ?? '')
+      const name = action[2] as 'start' | 'stop' | 'restart'
+      options.api[name](id).then(
+        (snapshot) => sendJson(res, 200, snapshot),
+        (error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          const missing = message.includes('没有这个实例')
+          sendJson(res, missing ? 404 : 409, { error: missing ? 'not-found' : 'operation-failed', id, message })
+        },
+      )
       return
     }
 
     sendJson(res, 404, {
       error: 'not-found',
       route,
-      hint: 'M0 只提供 /api/state 与 /api/ping；实例管理接口将在 M1 加入。',
+      hint: '可用：GET /api/state、GET /api/instances、GET /api/instances/:id、GET /api/instances/:id/logs、POST /api/instances/:id/{start,stop,restart}',
     })
   }
 }
