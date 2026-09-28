@@ -440,20 +440,26 @@ function MirrorStage({
         const probeGuest = (): void => {
           if (probed || disposed) return
           probed = true
+          const markStuck = (reason: string): void => {
+            if (disposed) return
+            setStuck(true)
+            setNote(reason)
+          }
           void (async () => {
+            let probe = -1
             try {
-              const probe = await Promise.race([
+              probe = (await Promise.race([
                 view.executeJavaScript('document.body ? document.body.childElementCount : -1'),
                 new Promise((done) => setTimeout(() => done(-2), 5_000)),
-              ])
-              if (disposed || typeof probe !== 'number' || probe > 0) return
-              setStuck(true)
-              setNote(
-                '桌面原生视图已加载，但里面看起来是空的（远端界面可能没渲染出来）。可以点右侧按钮改用内嵌框架。',
-              )
+              ])) as number
             } catch {
-              /* 探测本身失败就当没发生，不要因此打断镜像 */
+              // 抛异常基本就是"压根没挂上"（主进程拒绝了挂载）——这种更要给提示，
+              // 早期版本在这里 catch 一下就走了，用户只会看到空白。
+              markStuck('桌面原生视图没能挂上（主进程可能拒绝了挂载）。可以点右侧按钮改用内嵌框架。')
+              return
             }
+            if (disposed || typeof probe !== 'number' || probe > 0) return
+            markStuck('桌面原生视图已加载，但里面看起来是空的（远端界面可能没渲染出来）。可以点右侧按钮改用内嵌框架。')
           })()
         }
         view.addEventListener('did-finish-load', probeGuest)
