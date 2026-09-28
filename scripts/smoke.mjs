@@ -559,6 +559,7 @@ const fixtureRunning = {
   detail: '运行中，远端端口 52478',
   remotePort: 52478,
   mirrorEntryUrl: 'http://127.0.0.1:19500/?k=ticket',
+  version: '0.2.0-rc.1',
   logs: { nextOffset: 0, lines: [] },
 }
 const fixtureStopped = {
@@ -602,14 +603,18 @@ try {
       mirrorEntryUrl: fixtureRunning.mirrorEntryUrl,
       onAction: () => {},
       onCheck: () => {},
+      onUpdate: () => {},
+      onRollback: () => {},
     }),
   )
   check(
-    '工具栏四个动作齐全',
-    ['预检', '启动', '重启', '停止'].every((label) => runningToolbar.includes(label)),
+    '工具栏动作齐全',
+    ['预检', '启动', '重启', '停止', '更新'].every((label) => runningToolbar.includes(label)),
     runningToolbar.slice(0, 120),
   )
   check('运行中时「启动」禁用、可「浏览器打开」', (runningToolbar.match(/disabled=""/g) ?? []).length >= 1)
+  check('没有更新记录时不显示「回滚」', runningToolbar.includes('回滚') === false)
+  check('工具栏显示版本', runningToolbar.includes('DSH 0.2.0-rc.1'), runningToolbar.slice(0, 200))
 
   const stoppedToolbar = renderToStaticMarkup(
     React.createElement(toolbarComponent, {
@@ -618,6 +623,8 @@ try {
       mirrorEntryUrl: undefined,
       onAction: () => {},
       onCheck: () => {},
+      onUpdate: () => {},
+      onRollback: () => {},
     }),
   )
   check(
@@ -625,6 +632,35 @@ try {
     (stoppedToolbar.match(/disabled=""/g) ?? []).length > (runningToolbar.match(/disabled=""/g) ?? []).length,
     `${String((stoppedToolbar.match(/disabled=""/g) ?? []).length)} vs ${String((runningToolbar.match(/disabled=""/g) ?? []).length)}`,
   )
+
+  // 已停止 + 有更新记录 → 出现「回滚」，并显示上次结果
+  const withUpdate = renderToStaticMarkup(
+    React.createElement(toolbarComponent, {
+      instance: {
+        ...fixtureStopped,
+        version: '0.2.0-rc.1',
+        lastUpdate: {
+          from: '0.2.0-rc.1',
+          to: '0.3.0',
+          command: 'npm i -g @deepseek-ai/dsh@latest',
+          at: 1,
+          ok: true,
+          detail: '更新命令以 0 退出（版本 0.2.0-rc.1 → 0.3.0）',
+          kind: 'update',
+        },
+      },
+      busy: undefined,
+      mirrorEntryUrl: undefined,
+      onAction: () => {},
+      onCheck: () => {},
+      onUpdate: () => {},
+      onRollback: () => {},
+    }),
+  )
+  check('有更新记录后出现「回滚」', withUpdate.includes('回滚'))
+  check('显示上次更新的版本变化', withUpdate.includes('0.2.0-rc.1') && withUpdate.includes('0.3.0'))
+  check('回滚按钮在停止态可用', /回滚/.test(withUpdate))
+  check('显示上周更新的成功状态', withUpdate.includes('成功'), withUpdate.slice(0, 200))
 } catch (error) {
   check('空列表给出配置指引', false, error instanceof Error ? error.message : String(error))
 }
@@ -651,6 +687,101 @@ try {
 } catch (error) {
   check('设置页能渲染出 HTML', false, error instanceof Error ? error.message : String(error))
 }
+
+/* ── 8. 更新 / 回滚 ── */
+
+console.log('\n[8] 更新与回滚（纯逻辑 + 接口）')
+const updateMod = await import(pathToFileURL(resolve(root, 'lib/instances/update.js')).href)
+
+check('parseVersion 解析裸版本', updateMod.parseVersion('0.2.0-rc.1') === '0.2.0-rc.1')
+check('parseVersion 从输出里挑版本', updateMod.parseVersion('dsh 1.2.3\n') === '1.2.3', String(updateMod.parseVersion('dsh 1.2.3')))
+check('parseVersion 无版本返回 undefined', updateMod.parseVersion('command not found') === undefined)
+
+check('isImmutableRuntime 认出 app.asar', updateMod.isImmutableRuntime('C:/x/app.asar/dsh/lib/bin.js') === true)
+check('isImmutableRuntime 对普通路径为假', updateMod.isImmutableRuntime('D:/dsh/lib/bin.js') === false)
+check('isImmutableRuntime 对 undefined 为假', updateMod.isImmutableRuntime(undefined) === false)
+
+check('renderCommand 替换 {version}', updateMod.renderCommand('npm i -g x@{version}', '1.2.3') === 'npm i -g x@1.2.3')
+check('renderCommand 无占位符则原样', updateMod.renderCommand('npm i -g x@latest', '1.2.3') === 'npm i -g x@latest')
+
+const wslInstance = { id: 'w', kind: 'wsl', enabled: true, distro: 'Ubuntu', jumpHosts: [] }
+const localInstance = { id: 'l', kind: 'local', enabled: true, jumpHosts: [] }
+const planWsl = updateMod.resolveUpdatePlan(wslInstance, 'D:/dsh/lib/bin.js', 'latest')
+check('wsl 有默认更新命令', planWsl.ok && planWsl.command === 'npm i -g @deepseek-ai/dsh@latest', String(planWsl.command))
+check('wsl 默认命令可回滚（带 {version}）', planWsl.versioned === true)
+const planLocal = updateMod.resolveUpdatePlan(localInstance, 'D:/dsh/lib/bin.js', 'latest')
+check('本机实例没有默认更新方式', planLocal.ok === false, String(planLocal.reason ?? '').slice(0, 60))
+check('并说明要写 updateCommand', String(planLocal.reason ?? '').includes('updateCommand'))
+const planAsar = updateMod.resolveUpdatePlan(localInstance, 'C:/app/app.asar/dsh/lib/bin.js', 'latest')
+check('内置运行时拒绝更新', planAsar.ok === false && String(planAsar.reason).includes('app.asar'))
+const configured = { ...localInstance, updateCommand: 'echo probe {version}' }
+const planConfigured = updateMod.resolveUpdatePlan(configured, 'D:/dsh/lib/bin.js', '9.9.9')
+check('显式配置生效', planConfigured.ok && planConfigured.command === 'echo probe 9.9.9', String(planConfigured.command))
+
+// 接口层：用假 api 走一遍真实 handler
+const lifecycleCalls = []
+const handler8 = createControlHandler({
+  prefix: '/remote-desks',
+  guard: () => undefined,
+  api: {
+    state: () => ({}),
+    instances: () => [],
+    instance: () => undefined,
+    start: async () => ({}),
+    stop: async () => ({}),
+    restart: async () => ({}),
+    logs: () => ({ nextOffset: 0, lines: [] }),
+    check: async () => ({ checks: [] }),
+    version: async (id) => {
+      lifecycleCalls.push(['version', id])
+      return { id, ok: true, version: '0.2.0-rc.1' }
+    },
+    update: async (id, target) => {
+      lifecycleCalls.push(['update', id, target])
+      if (id === 'running') throw new Error('实例 running 当前是「running」，请先停止再更新')
+      if (id === 'immutable') throw new Error('这个实例用的是桌面版自带运行时（app.asar 内的 DSH）')
+      return { id, ok: true, kind: 'update' }
+    },
+    rollback: async (id) => {
+      lifecycleCalls.push(['rollback', id])
+      return { id, ok: true, kind: 'rollback' }
+    },
+  },
+})
+const call8 = async (method, url, body) => {
+  const res = fakeResponse()
+  const req = {
+    method,
+    url,
+    headers: { host: '127.0.0.1:19387' },
+    setEncoding() {},
+    on(event, handler) {
+      if (event === 'data' && body !== undefined) handler(body)
+      if (event === 'end') handler()
+      return this
+    },
+  }
+  handler8(req, res)
+  await new Promise((done) => setTimeout(done, 30))
+  return res
+}
+
+check('GET version → 200', (await call8('GET', '/remote-desks/api/instances/a/version')).statusCode === 200)
+check('version 落到 api', lifecycleCalls.some((entry) => entry[0] === 'version'))
+const updated = await call8('POST', '/remote-desks/api/instances/a/update', '{"target":"0.1.0"}')
+check('POST update → 200', updated.statusCode === 200, String(updated.statusCode))
+check('update 透传 target', lifecycleCalls.some((entry) => entry[0] === 'update' && entry[2] === '0.1.0'))
+check('无 body 的 update 也接受', (await call8('POST', '/remote-desks/api/instances/a/update')).statusCode === 200)
+const runningRejected = await call8('POST', '/remote-desks/api/instances/running/update')
+check('运行中更新 → 409', runningRejected.statusCode === 409, String(runningRejected.statusCode))
+check(
+  '409 里带着原因',
+  String(JSON.parse(runningRejected.body).message).includes('先停止'),
+  String(JSON.parse(runningRejected.body).message ?? '').slice(0, 60),
+)
+check('内置运行时更新 → 409', (await call8('POST', '/remote-desks/api/instances/immutable/update')).statusCode === 409)
+check('POST rollback → 200', (await call8('POST', '/remote-desks/api/instances/a/rollback')).statusCode === 200)
+check('GET 打 update → 404', (await call8('GET', '/remote-desks/api/instances/a/update')).statusCode === 404)
 
 /* ── 汇总 ── */
 

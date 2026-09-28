@@ -1,4 +1,7 @@
+import { readFile } from 'node:fs/promises'
 import { connect } from 'node:net'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
 
 import { MirrorEndpoint } from '../mirror/endpoint.js'
 import { asSocket, sshUpstream, tcpUpstream, type UpstreamConnector } from '../mirror/upstream.js'
@@ -7,7 +10,8 @@ import { SshConnection } from '../ssh/manager.js'
 import { sshProcessHandle } from '../ssh/process.js'
 import { exchangeSession, findReadyUrl } from './readiness.js'
 import { preflight, type PreflightCheck } from './preflight.js'
-import { planFor } from './spec.js'
+import { POSIX_SHELL_PREFIX, planFor, wslShellArgv } from './spec.js'
+import { parseVersion, resolveUpdatePlan, type VersionProbe } from './update.js'
 import {
   instanceById,
   labelOf,
@@ -15,6 +19,8 @@ import {
   type InstancePhase,
   type InstanceSnapshot,
   type SupervisorDeps,
+  type UpdateOutcome,
+  type UpdateRecord,
 } from './types.js'
 
 /** 子进程句柄（结构化声明，避免依赖未随发行版发布 .d.ts 的包）。 */
@@ -47,6 +53,12 @@ const MAX_LOG_LINES = 600
 const READY_TIMEOUT_MS = 90_000
 const POLL_INTERVAL_MS = 200
 const PROBE_TIMEOUT_MS = 4_000
+/** 版本探测超时：远端要 source nvm，给宽一点。 */
+const VERSION_TIMEOUT_MS = 30_000
+/** 更新/回滚超时：包管理器可能拉很久。 */
+const UPDATE_TIMEOUT_MS = 10 * 60_000
+/** 命令输出进日志环时最多保留的行数（避免 npm 刷屏把环冲掉）。 */
+const UPDATE_LOG_LINES = 40
 
 interface Runtime {
   handle?: SubprocessHandleLike
@@ -78,6 +90,9 @@ interface Runtime {
   readyFromGlobal: number
   poll?: NodeJS.Timeout
   busy: boolean
+  /** 已知的 DSH 版本，以及最近一次更新/回滚。 */
+  version?: string
+  lastUpdate?: UpdateRecord
 }
 
 /**
@@ -127,6 +142,8 @@ export class InstanceSupervisor {
       ...(runtime.upstreamDescription === undefined ? {} : { upstream: runtime.upstreamDescription }),
       ...(runtime.error === undefined ? {} : { error: runtime.error }),
       ...(runtime.exit === undefined ? {} : { exit: runtime.exit }),
+      ...(runtime.version === undefined ? {} : { version: runtime.version }),
+      ...(runtime.lastUpdate === undefined ? {} : { lastUpdate: runtime.lastUpdate }),
       logs: { nextOffset: runtime.base + runtime.lines.length, lines: runtime.lines },
     }
   }
@@ -142,12 +159,258 @@ export class InstanceSupervisor {
   async check(id: string): Promise<{ id: string; checks: PreflightCheck[] }> {
     const instance = instanceById(this.config, id)
     if (instance === undefined) throw new Error(`没有这个实例：${id}`)
+    const runtime = this.runtimeOf(id)
     const checks = await preflight(instance, {
       localRuntime: this.deps.localRuntime,
       dshHome: this.deps.dshHome,
       resolveCredential: this.deps.resolveCredential,
     })
+    // 顺带把版本探一下：面板因此能在启动前就显示"目标机上装的是哪一版"。
+    const probe = await this.probeVersion(instance, runtime)
+    if (probe.ok && probe.version !== undefined) runtime.version = probe.version
+    checks.push({ name: 'DSH 版本', ok: probe.ok, detail: probe.detail })
     return { id, checks }
+  }
+
+  /** 探测某个实例当前的 DSH 版本（不启动实例）。 */
+  async version(id: string): Promise<{ id: string; ok: boolean; version?: string; source: string; detail: string }> {
+    const instance = instanceById(this.config, id)
+    if (instance === undefined) throw new Error(`没有这个实例：${id}`)
+    const runtime = this.runtimeOf(id)
+    const probe = await this.probeVersion(instance, runtime)
+    if (probe.ok && probe.version !== undefined) runtime.version = probe.version
+    return {
+      id,
+      ok: probe.ok,
+      ...(probe.version === undefined ? {} : { version: probe.version }),
+      source: probe.source,
+      detail: probe.detail,
+    }
+  }
+
+  /**
+   * 升级实例上已安装的 DSH 包。
+   *
+   * 三条硬规矩：实例必须已停止（避免半个进程换版本）；不猜本机实例的安装方式（没配
+   * updateCommand 就明说）；桌面版内置运行时（app.asar）拒绝更新并说明该走应用更新。
+   */
+  async update(id: string, target?: string): Promise<UpdateOutcome> {
+    return await this.applyUpdate(id, target ?? 'latest', 'update')
+  }
+
+  /** 用最近一次更新记下的旧版本再跑一遍同一条命令。 */
+  async rollback(id: string): Promise<UpdateOutcome> {
+    const instance = instanceById(this.config, id)
+    if (instance === undefined) throw new Error(`没有这个实例：${id}`)
+    const runtime = this.runtimeOf(id)
+    const previous = runtime.lastUpdate?.from
+    if (previous === undefined) throw new Error('没有可回滚的版本记录（先成功更新过一次）')
+    return await this.applyUpdate(id, previous, 'rollback')
+  }
+
+  private async applyUpdate(
+    id: string,
+    version: string,
+    kind: 'update' | 'rollback',
+  ): Promise<UpdateOutcome> {
+    const instance = instanceById(this.config, id)
+    if (instance === undefined) throw new Error(`没有这个实例：${id}`)
+    const runtime = this.runtimeOf(id)
+    if (runtime.busy) throw new Error(`实例 ${id} 正在处理上一个操作`)
+    if (runtime.phase !== 'stopped') {
+      throw new Error(`实例 ${id} 当前是「${runtime.phase}」，请先停止再${kind === 'update' ? '更新' : '回滚'}`)
+    }
+
+    const plan = resolveUpdatePlan(instance, this.localEntry(instance), version)
+    if (!plan.ok || plan.command === undefined) throw new Error(plan.reason ?? '这个实例不支持更新')
+    if (kind === 'rollback' && !plan.versioned) {
+      throw new Error('updateCommand 里没有 {version} 占位符，无法指定回滚到哪个版本')
+    }
+
+    runtime.busy = true
+    try {
+      const before = await this.probeVersion(instance, runtime)
+      if (before.ok && before.version !== undefined) runtime.version = before.version
+      const label = kind === 'update' ? '更新' : '回滚'
+      this.append(runtime, `${label}：${plan.command}（当前版本 ${before.version ?? '未知'}）`)
+
+      const result = await this.runCommand(instance, runtime, plan.command, UPDATE_TIMEOUT_MS)
+      for (const line of tailLines(result.stdout)) this.append(runtime, line)
+      for (const line of tailLines(result.stderr)) this.append(runtime, `[stderr] ${line}`)
+
+      const after = await this.probeVersion(instance, runtime)
+      const ok = result.code === 0
+      const detail =
+        result.code === null
+          ? `${label}超时，已终止`
+          : ok
+            ? `${label}命令以 0 退出（版本 ${before.version ?? '未知'} → ${after.version ?? '未知'}）`
+            : `${label}命令以 ${String(result.code)} 退出`
+
+      const record: UpdateRecord = {
+        from: before.version,
+        to: after.version,
+        command: plan.command,
+        at: Date.now(),
+        ok,
+        detail,
+        kind,
+      }
+      runtime.lastUpdate = record
+      if (after.ok && after.version !== undefined) runtime.version = after.version
+      this.append(runtime, `${label}结果：${detail}`)
+
+      return {
+        id,
+        ok,
+        kind,
+        command: plan.command,
+        before,
+        after,
+        record,
+        rollbackable: after.ok && before.version !== undefined && plan.versioned,
+      }
+    } finally {
+      runtime.busy = false
+    }
+  }
+
+  /* ── 版本探测与远端命令 ── */
+
+  private localEntry(instance: RemoteDeskInstance): string | undefined {
+    if (instance.kind !== 'local') return undefined
+    return instance.entry ?? this.deps.localRuntime()?.entry
+  }
+
+  private async probeVersion(instance: RemoteDeskInstance, runtime: Runtime): Promise<VersionProbe> {
+    if (instance.kind === 'local') {
+      const entry = this.localEntry(instance)
+      if (entry === undefined) return { ok: false, source: 'local', detail: '找不到本机运行时入口' }
+      // <root>/lib/bin.js → <root>/package.json：读文件比起进程更快，也没有副作用。
+      const manifest = join(dirname(dirname(entry)), 'package.json')
+      try {
+        const parsed = JSON.parse(await readFile(manifest, 'utf8')) as { version?: string }
+        return parsed.version === undefined
+          ? { ok: false, source: manifest, detail: 'package.json 里没有 version 字段' }
+          : { ok: true, version: parsed.version, source: manifest, detail: `读到 ${parsed.version}` }
+      } catch (error) {
+        return { ok: false, source: manifest, detail: describeError(error) }
+      }
+    }
+
+    const result = await this.runCommand(instance, runtime, 'dsh -V', VERSION_TIMEOUT_MS)
+    const text = `${result.stdout}\n${result.stderr}`
+    const parsed = parseVersion(text)
+    return parsed === undefined
+      ? {
+          ok: false,
+          source: 'dsh -V',
+          detail: `没解析出版本（退出码 ${String(result.code)}）：${text.trim().split('\n').slice(-2).join(' / ').slice(0, 140)}`,
+        }
+      : { ok: true, version: parsed, source: 'dsh -V', detail: `读到 ${parsed}` }
+  }
+
+  /** 在实例所在的环境里跑一条 shell 命令，收集输出直到退出（超时则终止）。 */
+  private async runCommand(
+    instance: RemoteDeskInstance,
+    runtime: Runtime,
+    command: string,
+    timeoutMs: number,
+  ): Promise<{ code: number | null; stdout: string; stderr: string }> {
+    if (instance.kind === 'ssh') {
+      // 实例停止时没有常驻连接，临时开一条，用完即收。
+      const owned = runtime.ssh === undefined
+      const connection = runtime.ssh ?? this.createSsh(instance, runtime)
+      try {
+        const stream = await connection.exec(`${POSIX_SHELL_PREFIX}; ${command}`)
+        return await this.collect(sshProcessHandle(stream), timeoutMs)
+      } finally {
+        if (owned) await connection.dispose()
+      }
+    }
+
+    const subprocess = this.subprocess()
+    if (subprocess === undefined) throw new Error('宿主没有提供 subprocess 服务，无法执行命令')
+    const argv =
+      instance.kind === 'wsl'
+        ? wslShellArgv(instance, command)
+        : process.platform === 'win32'
+          ? ['cmd.exe', '/d', '/s', '/c', command]
+          : ['bash', '-lc', command]
+    const handle = subprocess.spawn({
+      argv,
+      cwd: instance.kind === 'local' ? (instance.cwd ?? homedir()) : process.cwd(),
+      stdio: { stdin: 'ignore', stdout: { maxBytes: 256 * 1024 }, stderr: { maxBytes: 256 * 1024 } },
+      graceMs: 5_000,
+      env: { ...process.env } as NodeJS.ProcessEnv,
+    })
+    return await this.collect(handle, timeoutMs)
+  }
+
+  /** 把句柄的输出抽干直到它退出；超时就终止，并把这件事写进 stderr。 */
+  private async collect(
+    handle: SubprocessHandleLike,
+    timeoutMs: number,
+  ): Promise<{ code: number | null; stdout: string; stderr: string }> {
+    const deadline = Date.now() + timeoutMs
+    let outOffset = 0
+    let errOffset = 0
+    let stdout = ''
+    let stderr = ''
+    let finished = false
+    const settled = handle.done.then(
+      () => {
+        finished = true
+      },
+      () => {
+        finished = true
+      },
+    )
+    const drain = (): void => {
+      const out = handle.collected.stdout?.readFrom(outOffset)
+      if (out !== undefined) {
+        outOffset = out.nextOffset
+        stdout += out.text
+      }
+      const err = handle.collected.stderr?.readFrom(errOffset)
+      if (err !== undefined) {
+        errOffset = err.nextOffset
+        stderr += err.text
+      }
+    }
+    while (!finished && Date.now() < deadline) {
+      drain()
+      await delay(200)
+    }
+    drain()
+    if (!finished) {
+      handle.terminate()
+      await Promise.race([settled, delay(3_000)])
+      drain()
+      return {
+        code: null,
+        stdout,
+        stderr: `${stderr}\n[超过 ${String(Math.round(timeoutMs / 1000))} 秒未结束，已终止]`,
+      }
+    }
+    await settled
+    const outcome = await handle.done.catch(() => ({ exitCode: null, signal: null }))
+    return { code: outcome.exitCode, stdout, stderr }
+  }
+
+  private createSsh(instance: RemoteDeskInstance, runtime: Runtime): SshConnection {
+    return new SshConnection({
+      target: {
+        host: instance.host ?? '',
+        port: instance.port ?? 22,
+        username: instance.username ?? '',
+        auth: instance.auth ?? { method: 'agent' },
+      },
+      jumpHosts: instance.jumpHosts,
+      resolveCredential: this.deps.resolveCredential,
+      log: (message) => this.append(runtime, message),
+      ...(instance.hostKeyFingerprint === undefined ? {} : { hostKeyFingerprint: instance.hostKeyFingerprint }),
+    })
   }
 
   async start(id: string): Promise<InstanceSnapshot> {
@@ -527,6 +790,15 @@ export class InstanceSupervisor {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms))
+}
+
+/** 只取命令输出的尾部若干行，避免 npm 刷屏把日志环冲掉。 */
+function tailLines(text: string, limit = UPDATE_LOG_LINES): string[] {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line !== '')
+    .slice(-limit)
 }
 
 async function probeTcp(host: string, port: number, timeoutMs = PROBE_TIMEOUT_MS): Promise<boolean> {

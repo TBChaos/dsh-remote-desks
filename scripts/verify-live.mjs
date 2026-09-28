@@ -75,6 +75,20 @@ function prepareProfile() {
     `        profile: mirror-bad-entry`,
     `        cwd: ${JSON.stringify(root)}`,
     `        readyTimeoutMs: 6000`,
+    // 更新机制用一条无害命令验证（真跑 npm i -g 会动到你机器上的安装，验证脚本不干这事）。
+    `      - id: upd-local`,
+    `        kind: local`,
+    `        label: 可更新实例`,
+    `        profile: mirror-upd-local`,
+    `        cwd: ${JSON.stringify(root)}`,
+    `        updateCommand: echo update-probe {version}`,
+    // 内置运行时（app.asar 内）必须被拒绝更新。
+    `      - id: upd-immutable`,
+    `        kind: local`,
+    `        label: 内置运行时`,
+    `        entry: C:\\\\fake\\\\app.asar\\\\dsh\\\\lib\\\\bin.js`,
+    `        profile: mirror-upd-immutable`,
+    `        cwd: ${JSON.stringify(root)}`,
   ]
   if (wslDistro !== '') {
     instances.push(`      - id: m1-wsl`, `        kind: wsl`, `        distro: ${wslDistro}`, `        cwd: /home/zmh`)
@@ -494,6 +508,15 @@ async function main() {
     }
 
     console.log('\n[停止] 逐个停止并确认收摊')
+    // 运行中的实例必须拒绝更新（避免半个进程换版本）
+    const updateWhileRunning = await post(`${base}/remote-desks/api/instances/m1-local/update`, { cookie })
+    check('运行中更新被拒（409）', updateWhileRunning.status === 409, String(updateWhileRunning.status))
+    check(
+      '409 里说明要先停止',
+      String(JSON.parse(updateWhileRunning.text).message ?? '').includes('先停止'),
+      String(JSON.parse(updateWhileRunning.text).message ?? '').slice(0, 60),
+    )
+
     for (const id of targets) {
       const stopped = await post(`${base}/remote-desks/api/instances/${id}/stop`, { cookie })
       check(`${id} POST stop → 200`, stopped.status === 200, String(stopped.status))
@@ -504,6 +527,46 @@ async function main() {
 
     const logs = await get(`${base}/remote-desks/api/instances/m1-local/logs?offset=0`, { cookie })
     check('实例日志可读', (JSON.parse(logs.text)?.lines ?? []).length > 0)
+
+    /* ── 更新 / 回滚（用无害命令验机制） ── */
+    console.log('\n[更新] 版本探测 → 更新 → 回滚')
+    const versionResponse = await get(`${base}/remote-desks/api/instances/upd-local/version`, { cookie })
+    check('GET version → 200', versionResponse.status === 200, String(versionResponse.status))
+    const versionBody = JSON.parse(versionResponse.text)
+    check('探测到了版本', versionBody.ok === true && typeof versionBody.version === 'string', `${String(versionBody.version)}（来源 ${String(versionBody.source)}）`)
+
+    const updated = await post(`${base}/remote-desks/api/instances/upd-local/update`, { cookie })
+    check('POST update → 200', updated.status === 200, String(updated.status))
+    const updateBody = JSON.parse(updated.text)
+    check('更新命令以 0 退出', updateBody.ok === true, String(updateBody.record?.detail))
+    check('记录里有 from / to', updateBody.record?.from !== undefined && updateBody.record?.to !== undefined, `${String(updateBody.record?.from)} → ${String(updateBody.record?.to)}`)
+    check('可回滚标记为真', updateBody.rollbackable === true, String(updateBody.rollbackable))
+    check('命令确实按 latest 渲染', updateBody.command === 'echo update-probe latest', String(updateBody.command))
+
+    const afterUpdate = await get(`${base}/remote-desks/api/instances/upd-local`, { cookie })
+    const afterUpdateBody = JSON.parse(afterUpdate.text)
+    check('快照带上了版本', typeof afterUpdateBody.version === 'string', String(afterUpdateBody.version))
+    check('快照带上了更新记录', afterUpdateBody.lastUpdate?.kind === 'update', String(afterUpdateBody.lastUpdate?.kind))
+    check(
+      '日志里有更新命令的输出',
+      (afterUpdateBody.logs?.lines ?? []).some((line) => line.includes('update-probe latest')),
+      (afterUpdateBody.logs?.lines ?? []).slice(-3).join(' | '),
+    )
+
+    const rolledBack = await post(`${base}/remote-desks/api/instances/upd-local/rollback`, { cookie })
+    check('POST rollback → 200', rolledBack.status === 200, String(rolledBack.status))
+    const rollbackBody = JSON.parse(rolledBack.text)
+    check('回滚命令带上了旧版本', String(rollbackBody.command).includes(String(updateBody.record.from)), String(rollbackBody.command))
+    check('回滚记录 kind 正确', rollbackBody.record?.kind === 'rollback', String(rollbackBody.record?.kind))
+
+    const immutable = await post(`${base}/remote-desks/api/instances/upd-immutable/update`, { cookie })
+    check('内置运行时更新被拒（409）', immutable.status === 409, String(immutable.status))
+    check(
+      '拒绝原因提到 app.asar',
+      String(JSON.parse(immutable.text).message ?? '').includes('app.asar'),
+      String(JSON.parse(immutable.text).message ?? '').slice(0, 70),
+    )
+    check('未知实例取版本 → 404', (await get(`${base}/remote-desks/api/instances/nope/version`, { cookie })).status === 404)
   } finally {
     if (failures.length > 0) {
       const tail = stderr.trim().split('\n').slice(-18).join('\n  ')
@@ -520,7 +583,7 @@ async function main() {
       if (sshServer.exitCode === null) sshServer.kill('SIGKILL')
     }
     if (!keepProfile) {
-      for (const dir of [profileDir, join(dshHome, 'profiles', localInstanceProfile), join(dshHome, 'profiles', wslInstanceProfile)]) {
+      for (const dir of [profileDir, join(dshHome, 'profiles', localInstanceProfile), join(dshHome, 'profiles', wslInstanceProfile), join(dshHome, 'profiles', 'mirror-bad-entry'), join(dshHome, 'profiles', 'mirror-upd-local'), join(dshHome, 'profiles', 'mirror-upd-immutable')]) {
         try {
           rmSync(dir, { recursive: true, force: true })
         } catch {

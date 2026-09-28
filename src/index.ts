@@ -161,6 +161,9 @@ export function apply(ctx: RemoteDesksHostContext, config: RemoteDesksConfig): v
     restart: (id) => supervisor.restart(id),
     logs: (id, offset) => supervisor.logs(id, offset),
     check: (id) => supervisor.check(id),
+    version: (id) => supervisor.version(id),
+    update: (id, target) => supervisor.update(id, target),
+    rollback: (id) => supervisor.rollback(id),
   }
 
   const handler = createControlHandler({ prefix: CONTROL_PREFIX, guard, api })

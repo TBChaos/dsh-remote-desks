@@ -11,6 +11,12 @@ export interface ControlApi {
   logs(id: string, offset: number): unknown
   /** 启动前预检：不拉起实例，只列出缺什么。 */
   check(id: string): Promise<unknown>
+  /** 探测实例当前的 DSH 版本。 */
+  version(id: string): Promise<unknown>
+  /** 升级实例上的 DSH 包；target 省略时用 latest。 */
+  update(id: string, target?: string): Promise<unknown>
+  /** 回滚到最近一次更新前的版本。 */
+  rollback(id: string): Promise<unknown>
 }
 
 export interface ControlRouteOptions {
@@ -71,6 +77,44 @@ function routeOf(pathname: string, prefix: string): string {
   const rest = pathname.slice(prefix.length)
   if (rest === '' || rest === '/') return '/'
   return rest.endsWith('/') ? rest.slice(0, -1) : rest
+}
+
+/** 读一个小的 JSON 请求体（更新时可以带 target 版本）。 */
+function readJsonBody(req: IncomingMessage, limitBytes = 8 * 1024): Promise<Record<string, unknown> | undefined> {
+  return new Promise((resolvePromise) => {
+    let text = ''
+    let tooBig = false
+    req.setEncoding('utf8')
+    req.on('data', (chunk: string) => {
+      if (tooBig) return
+      text += chunk
+      if (text.length > limitBytes) tooBig = true
+    })
+    req.on('end', () => {
+      if (tooBig || text.trim() === '') {
+        resolvePromise(undefined)
+        return
+      }
+      try {
+        const parsed = JSON.parse(text) as unknown
+        resolvePromise(parsed !== null && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : undefined)
+      } catch {
+        resolvePromise(undefined)
+      }
+    })
+    req.on('error', () => resolvePromise(undefined))
+  })
+}
+
+/** 实例操作的错误语义统一在这里：找不到→404，其余（运行中/不支持/无记录）→409。 */
+function sendOperationError(res: ServerResponse, id: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error)
+  const missing = message.includes('没有这个实例')
+  sendJson(res, missing ? 404 : 409, {
+    error: missing ? 'not-found' : 'operation-failed',
+    id,
+    message,
+  })
 }
 
 export function createControlHandler(options: ControlRouteOptions) {
@@ -147,13 +191,34 @@ export function createControlHandler(options: ControlRouteOptions) {
       const name = action[2] as 'start' | 'stop' | 'restart'
       options.api[name](id).then(
         (snapshot) => sendJson(res, 200, snapshot),
-        (error: unknown) => {
-          const message = error instanceof Error ? error.message : String(error)
-          const missing = message.includes('没有这个实例')
-          sendJson(res, missing ? 404 : 409, { error: missing ? 'not-found' : 'operation-failed', id, message })
-        },
+        (error: unknown) => sendOperationError(res, id, error),
       )
       return
+    }
+
+    // 版本探测 / 更新 / 回滚
+    const lifecycle = /^\/api\/instances\/([^/]+)\/(version|update|rollback)$/.exec(route)
+    if (lifecycle !== null) {
+      const id = decodeURIComponent(lifecycle[1] ?? '')
+      const name = lifecycle[2]
+      if (name === 'version' && method === 'GET') {
+        options.api.version(id).then(
+          (result) => sendJson(res, 200, result),
+          (error: unknown) => sendOperationError(res, id, error),
+        )
+        return
+      }
+      if ((name === 'update' || name === 'rollback') && method === 'POST') {
+        void readJsonBody(req).then((body) => {
+          const target = typeof body?.target === 'string' && body.target !== '' ? body.target : undefined
+          const run = name === 'update' ? options.api.update(id, target) : options.api.rollback(id)
+          run.then(
+            (result) => sendJson(res, 200, result),
+            (error: unknown) => sendOperationError(res, id, error),
+          )
+        })
+        return
+      }
     }
 
     sendJson(res, 404, {

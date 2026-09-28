@@ -176,6 +176,30 @@ export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
+/**
+ * 远端 shell 的前置片段：发行版 / 远端里的 node 常常只配在 `~/.bashrc`（nvm），非交互 shell 不加载。
+ * 版本探测与更新命令都要带上它，否则远端会报 "dsh: command not found"。
+ */
+export const POSIX_SHELL_PREFIX =
+  '[ -x /usr/bin/node ] || { [ -s $HOME/.nvm/nvm.sh ] && . $HOME/.nvm/nvm.sh >/dev/null 2>&1; }'
+
+/** WSL 里执行一条任意 shell 命令（版本探测 / 更新都走它）。 */
+export function wslShellArgv(instance: RemoteDeskInstance, command: string): string[] {
+  if (instance.distro === undefined || instance.distro === '') {
+    throw new Error(`WSL 实例 ${instance.id} 缺少 distro`)
+  }
+  return [
+    'wsl.exe',
+    '-d',
+    instance.distro,
+    ...(instance.user === undefined || instance.user === '' ? [] : ['-u', instance.user]),
+    '--',
+    'bash',
+    '-lc',
+    `${POSIX_SHELL_PREFIX}; ${command}`,
+  ]
+}
+
 function describeExecutable(execPath: string): string {
   const name = execPath.split(/[\\/]/).pop() ?? execPath
   return name.toLowerCase().includes('electron') || name.toLowerCase().includes('deepseek')

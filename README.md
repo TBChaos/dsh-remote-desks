@@ -12,6 +12,115 @@
 
 ![面板里镜像另一个 DSH 实例](docs/panel-running.png)
 
+## 怎么用（完整流程）
+
+### 一次性准备
+
+```bash
+# 1) 装插件（本地目录 / npm 包 / git 地址都行）
+dsh plugin --profile desktop add D:\code\dsh-remote-desks
+#    或者用桌面版设置里的 Plugins 页安装
+
+# 2) 重启桌面应用（启动型 profile，新 bundle 行必须重启才加载）
+```
+
+重启后侧栏会出现 **「远端工作台」** 入口（在「插件」下面）。此时还没有实例，把下面三段里
+你需要的抄进 `C:\Users\<你>\.dsh\profiles\desktop\cordis.patch.yml`：
+
+```yaml
+- id: remote-desks
+  config:
+    instances:
+      - id: wsl-ubuntu          # 在 WSL 里跑一个 DSH，用它做 Linux 侧的活
+        kind: wsl
+        label: WSL · Ubuntu-24.04
+        distro: Ubuntu-24.04
+        cwd: /home/you/project
+      - id: local-dev           # 在本机再跑一个 DSH（用桌面版自带运行时）
+        kind: local
+        label: 本机
+        profile: mirror-local-dev
+        cwd: D:\work\demo
+      - id: build-server        # 连到服务器上已经在跑的 DSH
+        kind: ssh
+        label: 构建机
+        host: 10.0.0.8
+        username: deploy
+        cwd: /srv/app
+        auth: { method: privateKey, privateKeyPath: C:\Users\you\.ssh\id_ed25519 }
+```
+
+改完再重启一次（配置在启动时读取）。
+
+### 每天怎么用
+
+1. **打开面板**：侧栏点「远端工作台」。左侧是实例列表（状态点 + 本机/WSL/SSH 标记），
+   右侧是选中实例的详情与镜像区，底部是日志抽屉。
+2. **点「预检」**（推荐，几秒）：不启动任何东西，逐项告诉你这个实例能不能起来——本机看运行时
+   入口与工作目录；WSL 看发行版能否进入、里面有没有 node 与 dsh；SSH 看端口通不通、私钥可读
+   或凭据已配置、跳板逐跳可达。红色项就是缺的东西。
+3. **点「启动」**：状态点转黄（启动中）→ 转绿并显示远端端口（运行中）。首次启动会在目标机自动
+   创建一份隔离 profile（不需要包管理器）。随后镜像区出现**那台机器上的完整 DSH 界面**。
+4. **在镜像区里直接干活**：这不是截图也不是只读预览，就是另一台机器上那个 DSH 的真实界面——
+   开新会话、发消息、让它读写文件、跑命令，全部发生在**那台机器上**，用那台机器的工具链
+   （WSL 实例用发行版里的 Linux 工具，SSH 实例用远端主机）。
+5. **切实例**：列表里点另一行即可；各自端口与镜像地址互不影响，多个实例可同时运行。
+6. **看日志**：底部「展开日志」是该实例进程的 stdout/stderr（增量、自动贴底、可清屏）。
+7. **停**：「停止」先收掉镜像端点再终止进程，端口全部释放。
+8. **偶尔用**：「浏览器打开」把镜像地址交给系统浏览器；「重启」= 停止 + 启动（会换新端口）。
+
+### 界面里各处的含义
+
+| 位置 | 含义 |
+|---|---|
+| 状态点 | 灰=未启动，黄=启动中/停止中，绿=运行中，红=出错（旁边写明原因） |
+| 「运行中，远端端口 N」 | 那个 DSH 在它自己机器上监听的端口（只绑回环，外部访问不到） |
+| 镜像区下方小字 | 当前用的是哪种容器（桌面原生视图 / 内嵌框架 / 系统浏览器）及降级原因 |
+| 「预检」结果 | 逐项红绿，缺什么一目了然 |
+| 日志抽屉 | 该实例进程的输出；启动失败、更新结果都写在这里 |
+
+### 更新（升级那个实例上的 DSH）
+
+实例**已停止**时，工具栏的「更新」可用：先读出当前版本 → 跑更新命令 → 再读一次版本并记录
+结果（面板显示「上次更新：0.2.0-rc.1 → 0.3.0」）。想退回就点「回滚」，它用记下来的旧版本
+再跑同一条命令。
+
+默认命令按实例类型给：
+
+| 实例类型 | 默认更新命令 |
+|---|---|
+| `wsl` / `ssh` | `npm i -g @deepseek-ai/dsh@{version}`（`{version}` 默认 `latest`，回滚时换成旧版本） |
+| `local` | **没有默认值**。本机那份 DSH 可能是内置运行时、全局 npm 或自己 clone 的，猜错只会装出一份用不到的副本——请在实例上写 `updateCommand` |
+
+三条硬规矩：
+
+- 运行中的实例拒绝更新（避免半个进程换版本），先「停止」。
+- 桌面版**自带运行时**（`app.asar` 里那份）拒绝更新，并告诉你该走桌面应用自己的更新，
+  而不是假装成功。
+- 命令输出进日志抽屉（只留尾部 40 行，免得 npm 刷屏把环冲掉）；10 分钟不结束会终止。
+
+想用自己的方式更新？在实例配置里写 `updateCommand`，命令里可带 `{version}` 占位符
+（带占位符才支持精确回滚）：
+
+```yaml
+- id: local-dev
+  kind: local
+  updateCommand: npm i -g @deepseek-ai/dsh@{version}
+```
+
+### 出问题时按这个顺序看
+
+1. 面板点「预检」——多数问题（缺 dsh、私钥读不到、发行版进不去）这一步就写明。
+2. 底部「展开日志」——启动失败的具体原因、目标机 stderr 都在这。
+3. 设置页「远端工作台」——宿主能力矩阵：运行形态、DSH 发行版入口与来源、10 个宿主服务、
+   控制接口的闸门落点。
+
+### 目前不做 / 做不到的
+
+- **不会**在目标机自动安装 DSH：目标机没有 dsh 时只明确告诉你，装什么由你决定。
+- 桌面版自带运行时那份 DSH 无法被单独更新（见上）。
+- `openMode: rightbar`（把镜像开进官方右栏浏览器标签）是**实验性**的，见下文容器表。
+
 ## 它解决什么
 
 同一台机器上经常不止一套 DSH：Windows 本机一套、WSL 里一套、服务器上还有几套。
@@ -81,8 +190,14 @@ dsh plugin --profile desktop add <本目录路径>
 | `GET` | `/remote-desks/api/instances` | 全部实例的运行时快照 |
 | `GET` | `/remote-desks/api/instances/:id` | 单个实例快照（含 `phase` / 镜像地址 / 退出码） |
 | `GET` | `/remote-desks/api/instances/:id/logs?offset=N` | 增量拉日志（行号偏移，环形缓冲 600 行） |
-| `GET` | `/remote-desks/api/instances/:id/check` | **预检**：不启动实例，只列出缺什么 |
+| `GET` | `/remote-desks/api/instances/:id/check` | **预检**：不启动实例，只列出缺什么（含 DSH 版本） |
 | `POST` | `/remote-desks/api/instances/:id/start\|stop\|restart` | 生命周期操作 |
+| `GET` | `/remote-desks/api/instances/:id/version` | 探测该实例的 DSH 版本（本机读 package.json，WSL/SSH 跑 `dsh -V`） |
+| `POST` | `/remote-desks/api/instances/:id/update` | **更新**：升级该实例上安装的 DSH。可选 JSON 体 `{"target":"0.3.0"}`，省略即 `latest` |
+| `POST` | `/remote-desks/api/instances/:id/rollback` | **回滚**到最近一次更新前的版本（要求命令里带 `{version}`） |
+
+更新与回滚的拒绝语义（都是 409 + `message`）：实例未停止、内置运行时（`app.asar`）、
+本机实例没配 `updateCommand`、没有可回滚的记录。未知实例一律 404。
 
 **预检**（面板工具栏上的「预检」按钮）回答的是"点了启动会不会失败"：
 
@@ -302,7 +417,7 @@ cordis.patch.yml        bundle patch（安装时并入 profile）
 | M1 | 多实例并发：实例监管器、本机与 WSL 启动器、镜像代理、面板标签切换 | **完成并验证**（本机 + WSL 两条腿） |
 | M2 | SSH 实例（含跳板机，数据面走 `forwardOut`，不开远端端口） | **完成并验证**（测试对端，真实 SSH 协议） |
 | M3 | 打磨：多实例并发验证、日志抽屉、纯 Web 版适配、文档 | **完成**（界面渲染待你验收） |
-| — | 更新（升级实例的 DSH 包） | 挂起，按约定 M1–M3 跑通后再评估 |
+| M4 | 更新：版本探测、按类型选择更新命令、回滚、结果入日志与面板 | **完成并验证**（机制用无害命令验证；内置运行时明确拒绝） |
 
 ## 已知边界（未自动验证的部分）
 

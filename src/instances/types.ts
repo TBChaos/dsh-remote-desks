@@ -9,6 +9,17 @@ export interface InstanceLogView {
   lines: string[]
 }
 
+/** 一次更新/回滚的记录，面板据此显示「从 X 到 Y」并提供回滚。 */
+export interface UpdateRecord {
+  from?: string
+  to?: string
+  command: string
+  at: number
+  ok: boolean
+  detail: string
+  kind: 'update' | 'rollback'
+}
+
 export interface InstanceSnapshot {
   id: string
   kind: InstanceKind
@@ -29,11 +40,27 @@ export interface InstanceSnapshot {
   upstream?: string
   error?: string
   exit?: { code: number | null; signal: string | null }
+  /** 已知的 DSH 版本（启动或预检时探测到）。 */
+  version?: string
+  /** 最近一次更新/回滚记录。 */
+  lastUpdate?: UpdateRecord
   logs: InstanceLogView
 }
 
-export interface LaunchSpec {
-  argv: string[]
+/** 更新 / 回滚的结果（面板直接展示）。 */
+export interface UpdateOutcome {
+  id: string
+  ok: boolean
+  kind: 'update' | 'rollback'
+  command: string
+  before: { ok: boolean; version?: string; source: string; detail: string }
+  after: { ok: boolean; version?: string; source: string; detail: string }
+  record: UpdateRecord
+  /** 有旧版本记录、且命令里带 {version} 时才可以回滚。 */
+  rollbackable: boolean
+}
+
+export interface LaunchSpec {  argv: string[]
   cwd: string
   env: Record<string, string | undefined>
   /** 排障用的一句话描述（不包含凭据）。 */

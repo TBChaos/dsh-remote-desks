@@ -75,6 +75,16 @@ interface HostReport {
   config: { instances: number; enabledInstances: number; autoStart: number; openMode: string }
 }
 
+interface UpdateRecordView {
+  from?: string
+  to?: string
+  command: string
+  at: number
+  ok: boolean
+  detail: string
+  kind: 'update' | 'rollback'
+}
+
 interface InstanceSnapshot {
   id: string
   kind: 'local' | 'wsl' | 'ssh'
@@ -87,6 +97,10 @@ interface InstanceSnapshot {
   mirrorEntryUrl?: string
   upstream?: string
   error?: string
+  /** 已知的 DSH 版本（启动或预检时探测）。 */
+  version?: string
+  /** 最近一次更新/回滚。 */
+  lastUpdate?: UpdateRecordView
   logs: { nextOffset: number; lines: string[] }
 }
 
@@ -485,64 +499,101 @@ export function InstanceList({
   )
 }
 
-/** 实例工具栏（纯展示）：预检 / 启动 / 重启 / 停止 / 浏览器打开。 */
+/** 实例工具栏（纯展示）：预检 / 启动 / 重启 / 停止 / 更新 / 回滚 / 浏览器打开。 */
 export function InstanceToolbar({
   instance,
   busy,
   mirrorEntryUrl,
   onAction,
   onCheck,
+  onUpdate,
+  onRollback,
 }: {
   instance: InstanceSnapshot
   busy: string | undefined
   mirrorEntryUrl: string | undefined
   onAction: (id: string, action: 'start' | 'stop' | 'restart') => void
   onCheck: (id: string) => void
+  onUpdate: (id: string) => void
+  onRollback: (id: string) => void
 }): ReactNode {
+  const stopped = instance.phase === 'stopped'
+  const last = instance.lastUpdate
   return (
-    <div className="drd-toolbar">
-      <strong>{instance.label}</strong>
-      <span className="drd-meta">{instance.detail}</span>
-      <div className="drd-spacer" />
-      <button type="button" className="drd-btn" disabled={busy !== undefined} onClick={() => onCheck(instance.id)}>
-        预检
-      </button>
-      <button
-        type="button"
-        className="drd-btn"
-        disabled={instance.phase === 'running' || busy !== undefined}
-        onClick={() => onAction(instance.id, 'start')}
-      >
-        启动
-      </button>
-      <button
-        type="button"
-        className="drd-btn"
-        disabled={instance.phase === 'stopped' || busy !== undefined}
-        onClick={() => onAction(instance.id, 'restart')}
-      >
-        重启
-      </button>
-      <button
-        type="button"
-        className="drd-btn"
-        disabled={instance.phase === 'stopped' || busy !== undefined}
-        onClick={() => onAction(instance.id, 'stop')}
-      >
-        停止
-      </button>
-      <button
-        type="button"
-        className="drd-btn"
-        disabled={mirrorEntryUrl === undefined}
-        onClick={() => {
-          if (mirrorEntryUrl !== undefined) window.open(mirrorEntryUrl, '_blank', 'noopener')
-        }}
-        title="用系统浏览器打开镜像地址"
-      >
-        浏览器打开
-      </button>
-    </div>
+    <>
+      <div className="drd-toolbar">
+        <strong>{instance.label}</strong>
+        <span className="drd-meta">
+          {instance.detail}
+          {instance.version === undefined ? '' : ` ｜ DSH ${instance.version}`}
+        </span>
+        <div className="drd-spacer" />
+        <button type="button" className="drd-btn" disabled={busy !== undefined} onClick={() => onCheck(instance.id)}>
+          预检
+        </button>
+        <button
+          type="button"
+          className="drd-btn"
+          disabled={instance.phase === 'running' || busy !== undefined}
+          onClick={() => onAction(instance.id, 'start')}
+        >
+          启动
+        </button>
+        <button
+          type="button"
+          className="drd-btn"
+          disabled={instance.phase === 'stopped' || busy !== undefined}
+          onClick={() => onAction(instance.id, 'restart')}
+        >
+          重启
+        </button>
+        <button
+          type="button"
+          className="drd-btn"
+          disabled={instance.phase === 'stopped' || busy !== undefined}
+          onClick={() => onAction(instance.id, 'stop')}
+        >
+          停止
+        </button>
+        <button
+          type="button"
+          className="drd-btn"
+          title="升级这个实例上安装的 DSH（需先停止）"
+          disabled={!stopped || busy !== undefined}
+          onClick={() => onUpdate(instance.id)}
+        >
+          更新
+        </button>
+        {last === undefined ? null : (
+          <button
+            type="button"
+            className="drd-btn"
+            title={`回滚到 ${last.from ?? '上一个版本'}`}
+            disabled={!stopped || busy !== undefined || last.from === undefined || !last.ok}
+            onClick={() => onRollback(instance.id)}
+          >
+            回滚
+          </button>
+        )}
+        <button
+          type="button"
+          className="drd-btn"
+          disabled={mirrorEntryUrl === undefined}
+          onClick={() => {
+            if (mirrorEntryUrl !== undefined) window.open(mirrorEntryUrl, '_blank', 'noopener')
+          }}
+          title="用系统浏览器打开镜像地址"
+        >
+          浏览器打开
+        </button>
+      </div>
+      {last === undefined ? null : (
+        <div className="drd-meta" style={{ padding: '6px 16px' }}>
+          {last.kind === 'update' ? '上次更新' : '上次回滚'}（{last.ok ? '成功' : '失败'}）：
+          {last.from ?? '未知'} → {last.to ?? '未知'} ｜ {last.detail}
+        </div>
+      )}
+    </>
   )
 }
 
@@ -577,6 +628,24 @@ function Panel(props: PanelServices): ReactNode {
     }
   }
 
+  /** 更新 / 回滚：都是 POST 一个动作，结束后刷新列表让版本与结果立刻可见。 */
+  const runLifecycle = async (id: string, action: 'update' | 'rollback'): Promise<void> => {
+    setBusy(`${id}:${action}`)
+    setChecks(undefined)
+    try {
+      const response = await fetch(`${INSTANCES_URL}/${encodeURIComponent(id)}/${action}`, { method: 'POST' })
+      if (!response.ok) {
+        const body = (await response.json().catch(() => ({}))) as { message?: string }
+        setChecks({ phase: 'error', message: body.message ?? `HTTP ${response.status}` })
+      }
+    } catch (error) {
+      setChecks({ phase: 'error', message: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setBusy(undefined)
+      await refresh()
+    }
+  }
+
   return (
     <div className="drd-root">
       <div className="drd-bar">
@@ -605,6 +674,8 @@ function Panel(props: PanelServices): ReactNode {
                 busy={busy}
                 mirrorEntryUrl={open}
                 onAction={(id, action) => void run(id, action)}
+                onUpdate={(id) => void runLifecycle(id, 'update')}
+                onRollback={(id) => void runLifecycle(id, 'rollback')}
                 onCheck={(id) => {
                   setChecks({ phase: 'loading' })
                   fetch(`${INSTANCES_URL}/${encodeURIComponent(id)}/check`, {
