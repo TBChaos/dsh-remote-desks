@@ -51,6 +51,8 @@ export interface SupervisorDeps {
   localRuntime: () => LocalRuntime | undefined
   /** DSH_HOME，用于放置自动创建的 profile。 */
   dshHome: string
+  /** 按名字解析凭据（SSH 密码 / 私钥口令），走 DSH 凭据库。 */
+  resolveCredential: (name: string) => Promise<string | undefined>
   /** 写一行日志到宿主日志。 */
   log: (message: string) => void
 }

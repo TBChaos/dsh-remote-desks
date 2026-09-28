@@ -1,4 +1,5 @@
 import { request as httpRequest } from 'node:http'
+import type { Duplex } from 'node:stream'
 
 /** 就绪行：DSH 官方把这一行定义为 supervisor 的就绪信号。 */
 const READY_PATTERN = /dsh web:\s*(https?:\/\/\S+)/
@@ -15,6 +16,17 @@ export interface SessionExchange {
   detail: string
 }
 
+export interface ExchangeOptions {
+  timeoutMs?: number
+  /**
+   * 自定义传输：SSH 实例的远端回环地址在本地根本连不通，必须走 `forwardOut`。
+   * 给了它就只按"远端自己的 authority"发请求（Host 头写 127.0.0.1:<port>）。
+   */
+  connect?: () => Promise<Duplex>
+  /** 远端端口，用于拼 Host 头。 */
+  remotePort?: number
+}
+
 /**
  * 用就绪地址里的 token 换一次会话 cookie。
  *
@@ -23,8 +35,9 @@ export interface SessionExchange {
  */
 export function exchangeSession(
   readyUrl: string,
-  timeoutMs = 10_000,
+  options: ExchangeOptions = {},
 ): Promise<SessionExchange> {
+  const timeoutMs = options.timeoutMs ?? 10_000
   return new Promise<SessionExchange>((resolvePromise) => {
     let settled = false
     const finish = (result: SessionExchange): void => {
@@ -33,15 +46,31 @@ export function exchangeSession(
       resolvePromise(result)
     }
     const parsed = new URL(readyUrl)
-    const req = httpRequest(
-      {
-        hostname: parsed.hostname,
-        port: parsed.port,
-        path: `${parsed.pathname}${parsed.search}`,
-        method: 'GET',
-        headers: { accept: 'text/html' },
-      },
-      (res) => {
+    const path = `${parsed.pathname}${parsed.search}`
+
+    const send = (socket?: Duplex): void => {
+      const requestOptions =
+        socket === undefined
+          ? {
+              hostname: parsed.hostname,
+              port: parsed.port,
+              path,
+              method: 'GET' as const,
+              headers: { accept: 'text/html' },
+            }
+          : {
+              // createConnection 必须**同步**返回 socket，所以隧道要提前开好。
+              // 另外不能传 agent：传了 Node 就忽略 createConnection 去直连。
+              createConnection: () => socket,
+              setHost: false,
+              path,
+              method: 'GET' as const,
+              headers: {
+                host: `127.0.0.1:${String(options.remotePort ?? Number(parsed.port))}`,
+                accept: 'text/html',
+              },
+            }
+      const req = httpRequest(requestOptions, (res) => {
         const setCookie = res.headers['set-cookie']
         const cookie = Array.isArray(setCookie)
           ? setCookie.map((value) => value.split(';')[0]).filter((value) => value !== undefined).join('; ')
@@ -59,14 +88,23 @@ export function exchangeSession(
                 : `HTTP ${String(res.statusCode ?? 0)}，已取得会话 cookie`,
           })
         })
-      },
+      })
+      req.setTimeout(timeoutMs, () => {
+        req.destroy(new Error(`换取会话 cookie 超时（${String(timeoutMs)}ms）`))
+      })
+      req.on('error', (error) => {
+        finish({ ok: false, status: 0, detail: error.message })
+      })
+      req.end()
+    }
+
+    if (options.connect === undefined) {
+      send()
+      return
+    }
+    options.connect().then(
+      (socket) => send(socket),
+      (error: unknown) => finish({ ok: false, status: 0, detail: `隧道建立失败：${error instanceof Error ? error.message : String(error)}` }),
     )
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error(`换取会话 cookie 超时（${String(timeoutMs)}ms）`))
-    })
-    req.on('error', (error) => {
-      finish({ ok: false, status: 0, detail: error.message })
-    })
-    req.end()
   })
 }

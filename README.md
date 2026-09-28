@@ -6,8 +6,8 @@
 镜像出来的界面就是 DSH 自己的前端（随远端版本走），桌面窗口的外壳、主题、侧栏与快捷键
 全部复用当前应用，不另造一套 UI。
 
-> **状态：M0 完成；M1 宿主侧完成并已验证（本机 + WSL 两条腿）。** 实例监管器、镜像代理、
-> 控制接口都能跑了；**客户端面板还停留在 M0 的占位**，实例列表/标签切换/镜像区尚未接。
+> **状态：M0 / M1 / M2 完成并已验证。** 本机、WSL、SSH 三种实例都能启动、镜像、停止；
+> 桌面面板与容器降级链已接好。剩下 M3（打磨：日志面板加强、纯 Web 版适配、文档收尾）。
 > 里程碑与已核实的技术约束见 [里程碑与范围](#里程碑与范围)。
 
 ## 它解决什么
@@ -116,6 +116,46 @@ dsh plugin --profile desktop add <本目录路径>
 
 > 想用自己的启动方式？把 `launchCommand` 写进实例配置即可，但上面三条约束同样适用。
 
+## SSH 实例
+
+```yaml
+- id: build-server
+  kind: ssh
+  host: 10.0.0.8
+  port: 22
+  username: deploy
+  cwd: /srv/app
+  auth:
+    method: password                 # privateKey | password | agent
+    passwordCredential: BUILD_SERVER_PASSWORD
+  # 可选：固定主机密钥指纹（SHA256 base64）
+  # hostKeyFingerprint: SHA256:xxxx
+  # 可选：跳板链
+  # jumpHosts:
+  #   - { host: jump.example, port: 22, username: ops }
+```
+
+- **认证**：`privateKey` 读 `privateKeyPath`（口令走 `passphraseCredential`）、`password` 走
+  `passwordCredential`、`agent` 用 `SSH_AUTH_SOCK`（Windows 退到 `\\.\pipe\openssh-ssh-agent`）。
+- **凭据**：`*Credential` 字段是 DSH 凭据库里的**名字**。名字也可以直接是环境变量名——
+  凭据服务本身就把进程环境当作一层来源，所以 CI/验证场景不必往凭据库里写东西。
+- **主机密钥**：默认 TOFU——接受并在实例日志里打印 `SHA256:…` 指纹；把指纹写进
+  `hostKeyFingerprint` 即变成硬校验，不匹配直接拒连。
+- **数据面**：控制面与数据面**共用一条 SSH 连接**，每条上游请求就是一条 `direct-tcpip` 通道
+  （`forwardOut`）。远端不需要暴露端口，也不用建本地端口转发；换 cookie 的那次请求同样走隧道。
+
+### 本机怎么验证 SSH 腿
+
+这台机器上既没有 Windows sshd、WSL 也没装 openssh-server，所以仓库自带一个**测试对端**
+（`scripts/ssh-test-server.mjs`，用 ssh2 的 Server 实现，把 exec 与 direct-tcpip 都转给 WSL）：
+
+```bash
+node scripts/ssh-test-server.mjs --port 12222 --password dsh-test      # 手动起
+node scripts/verify-live.mjs --ssh --pnpm <pnpm.mjs> --node <node.exe> # 验证脚本自己起
+```
+
+它只用于验证**我们这一侧**的连接、认证、通道与隧道代码，**不要当生产服务用**。
+
 ## 开发
 
 ```bash
@@ -129,7 +169,7 @@ pnpm verify:live  # 起一个真实 DSH 实例做端到端验证（见下）
 
 ### 三道验证
 
-**第一道 · `pnpm smoke`（53 项）** 跑真实产物，不复述实现：
+**第一道 · `pnpm smoke`（112 项）** 跑真实产物，不复述实现：
 
 1. 导入 `lib/index.js`，检查插件契约（`name` / `inject` / `Config` / `apply`），
    用真实 `Config` 校验空配置补全、默认值、非法 `kind` 与缺 `id` 的拒绝；
@@ -141,19 +181,21 @@ pnpm verify:live  # 起一个真实 DSH 实例做端到端验证（见下）
    （非基线模块直接报错），取出工厂并调 `apply()`，断言它挂上了
    `sidebar.panellist` / `main` / `settings.section` 三处注册，且面板 id 与入口 id 一致。
 
-**第二道 · `pnpm verify:live`（15 项）** 起一个真实 DSH web 实例（临时 profile，
-`dsh-base` + `dsh-web-app` + 本插件），验证真实 Loader 树里的行为：
+**第二道 · `pnpm verify:live`（三条腿：本机 / WSL / SSH）** 起一个真实 DSH web 宿主（临时 profile，
+`dsh-base` + `dsh-web-app` + 本插件），在里面驱动插件真的拉起实例，并逐条验证：
 
 ```bash
 node scripts/verify-live.mjs \
   --pnpm "C:\Users\you\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\pnpm\bin\pnpm.mjs" \
-  --node "C:\Users\you\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe"
+  --node "C:\Users\you\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe" \
+  --wsl Ubuntu-24.04 --ssh
 ```
 
-它会：等 `dsh web:` 就绪行 → 裸请求被拒（401）→ token 换 cookie → 带 cookie 拿到能力矩阵
-（`gate` 显示为 `connection.requestRejection + loopback-guard`）→ 伪造非回环 Host 得 403 →
-index 的 `window.__DSH_BOOT__` 里出现本插件的行 → 按该行 URL 取到 `__ModuleLoader__` 形态的
-客户端 bundle。跑完自动清理 profile（`--keep-profile` 可保留）。
+它会：等 `dsh web:` 就绪行 → 裸请求被拒（401）→ token 换 cookie → 能力矩阵 200
+（`gate = connection.requestRejection + loopback-guard`）→ 伪造非回环 Host 得 403 →
+index 的 `window.__DSH_BOOT__` 里出现本插件的行 → 取到 `__ModuleLoader__` 形态的客户端 bundle；
+然后对**每一个**实例：启动 → 就绪 → 无票据 403 → 票据换 cookie 302 → **镜像 UI 200** →
+镜像里的子资源 200 → 停止 → 端点收摊。跑完自动清理 profile（`--keep-profile` 可保留）。
 
 **第三道 · 装进桌面版**：`dsh-remote-desks` 已装入 desktop profile，`dsh.bundle.patch` 会把
 `remote-desks` 行插进 Loader 树。桌面版是**启动型 profile**，加载新 bundle 行需要**重启一次
@@ -181,10 +223,10 @@ cordis.patch.yml        bundle patch（安装时并入 profile）
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | M0 | 骨架、能力探测、控制接口、面板占位 | **完成并验证** |
-| M1 | 多实例并发：实例监管器、本机与 WSL 启动器、镜像代理、面板标签切换 | 待做 |
-| M2 | SSH 实例（含跳板机，数据面走 `forwardOut`，不开远端端口） | 待做 |
+| M1 | 多实例并发：实例监管器、本机与 WSL 启动器、镜像代理、面板标签切换 | **完成并验证**（本机 + WSL 两条腿） |
+| M2 | SSH 实例（含跳板机，数据面走 `forwardOut`，不开远端端口） | **完成并验证**（测试对端，真实 SSH 协议） |
 | M3 | 打磨：日志面板、纯 Web 版适配、中文文案与文档 | 待做 |
-| — | 更新（升级实例的 DSH 包） | 挂起，M1–M3 跑通后再评估 |
+| — | 更新（升级实例的 DSH 包） | 挂起，按约定 M1–M3 跑通后再评估 |
 
 ## 许可
 

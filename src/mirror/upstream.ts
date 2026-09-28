@@ -2,6 +2,48 @@ import { connect, type Socket } from 'node:net'
 import type { Duplex } from 'node:stream'
 
 /**
+ * 把一条非 TCP 的字节流伪装成 `net.Socket`。
+ *
+ * Node 的 http 客户端拿到 socket 后会调用 `setTimeout` / `setNoDelay` / `setKeepAlive` 等
+ * **只有 net.Socket 才有**的方法；ssh2 的通道只是个 Duplex，直接交给 `http.request` 会以
+ * `TypeError: sock.setTimeout is not a function` 崩掉整个进程（实测把宿主带走了）。
+ * 这里只补上缺失的那几个，真实的 net.Socket 走这个函数是空操作。
+ */
+export function asSocket(stream: Duplex): Duplex {
+  const shim = stream as Duplex & Record<string, unknown>
+  if (typeof shim.setTimeout !== 'function') {
+    shim.setTimeout = function setTimeout(this: Duplex, _ms?: number, callback?: () => void) {
+      if (typeof callback === 'function') this.once('timeout', callback)
+      return this
+    }
+  }
+  if (typeof shim.setNoDelay !== 'function') {
+    shim.setNoDelay = function setNoDelay(this: Duplex) {
+      return this
+    }
+  }
+  if (typeof shim.setKeepAlive !== 'function') {
+    shim.setKeepAlive = function setKeepAlive(this: Duplex) {
+      return this
+    }
+  }
+  if (typeof shim.ref !== 'function') {
+    shim.ref = function ref(this: Duplex) {
+      return this
+    }
+  }
+  if (typeof shim.unref !== 'function') {
+    shim.unref = function unref(this: Duplex) {
+      return this
+    }
+  }
+  if (typeof shim.address !== 'function') {
+    shim.address = () => ({ address: '127.0.0.1', family: 'IPv4', port: 0 })
+  }
+  return shim
+}
+
+/**
  * 一条指向"远端回环 web 端口"的字节通道。
  *
  * 三种实例的区别全在这里：本机直连、WSL 经中继、SSH 走 forwardOut。镜像代理只认这个接口，
@@ -53,5 +95,22 @@ export function tcpUpstream(
           signal.addEventListener('abort', onAbort, { once: true })
         }
       }),
+  }
+}
+
+/**
+ * 经 SSH 隧道连远端回环端口。
+ *
+ * 这是 SSH 实例与其它两种的**全部区别**：远端不需要暴露端口，也不用建本地端口转发，
+ * 每条上游连接就是一条 `direct-tcpip` 通道。
+ */
+export function sshUpstream(
+  connection: { forwardOut(host: string, port: number): Promise<Duplex> },
+  remotePort: number,
+): UpstreamConnector {
+  return {
+    kind: 'ssh-forward',
+    describe: () => `ssh-forward → 远端 127.0.0.1:${String(remotePort)}`,
+    connect: async () => asSocket(await connection.forwardOut('127.0.0.1', remotePort)),
   }
 }

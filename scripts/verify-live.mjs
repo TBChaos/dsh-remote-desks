@@ -24,6 +24,10 @@ const keepProfile = args.includes('--keep-profile')
 const pnpmEntry = argOf('pnpm', process.env.DSH_PNPM_ENTRY ?? '')
 const nodeBin = argOf('node', process.execPath)
 const wslDistro = argOf('wsl', '')
+const sshMode = args.includes('--ssh')
+const sshPort = Number(argOf('ssh-port', '12222'))
+const sshPassword = argOf('ssh-password', 'dsh-remote-desks-test')
+const sshCredentialRef = 'DSH_REMOTE_DESKS_TEST_SSH_PASSWORD'
 
 const dshHome = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? process.env.HOME ?? '.', '.dsh')
 const profileDir = join(dshHome, 'profiles', profile)
@@ -66,6 +70,19 @@ function prepareProfile() {
   ]
   if (wslDistro !== '') {
     instances.push(`      - id: m1-wsl`, `        kind: wsl`, `        distro: ${wslDistro}`, `        cwd: /home/zmh`)
+  }
+  if (sshMode) {
+    instances.push(
+      `      - id: m2-ssh`,
+      `        kind: ssh`,
+      `        host: 127.0.0.1`,
+      `        port: ${String(sshPort)}`,
+      `        username: dsh-test`,
+      `        cwd: /home/zmh`,
+      `        auth:`,
+      `          method: password`,
+      `          passwordCredential: ${sshCredentialRef}`,
+    )
   }
   writeFileSync(
     join(profileDir, 'cordis.patch.yml'),
@@ -204,7 +221,25 @@ async function verifyMirror(base, cookie, id) {
 }
 
 async function main() {
-  console.log(`\n[prepare] profile=${profile} port=${String(port)} wsl=${wslDistro === '' ? '（跳过）' : wslDistro}`)
+  console.log(`\n[prepare] profile=${profile} port=${String(port)} wsl=${wslDistro === '' ? '（跳过）' : wslDistro} ssh=${sshMode ? `127.0.0.1:${String(sshPort)}` : '（跳过）'}`)
+
+  // M2：起一个测试用 SSH 对端（exec 与隧道都转给 WSL），让 SSH 腿也能真的跑起来。
+  let sshServer
+  if (sshMode) {
+    sshServer = spawn(nodeBin, [join(root, 'scripts', 'ssh-test-server.mjs'), '--port', String(sshPort), '--password', sshPassword, '--distro', wslDistro === '' ? 'Ubuntu-24.04' : wslDistro], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let banner = ''
+    sshServer.stdout.setEncoding('utf8')
+    sshServer.stderr.setEncoding('utf8')
+    sshServer.stdout.on('data', (chunk) => {
+      banner += chunk
+    })
+    const deadlineAt = Date.now() + 20_000
+    while (Date.now() < deadlineAt && !banner.includes('监听')) await wait(200)
+    check('测试 SSH 对端已就绪', banner.includes('监听'), banner.trim().split('\n').slice(-1)[0] ?? '')
+  }
+
   prepareProfile()
   installProfile()
 
@@ -213,7 +248,8 @@ async function main() {
   const child = spawn(nodeBin, [entry, '--profile', profile, '--port', String(port), '--no-open'], {
     cwd: profileDir,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, DSH_HOME: dshHome },
+    // 凭据走"环境变量引用"这条路，不去写用户的凭据库。
+    env: { ...process.env, DSH_HOME: dshHome, [sshCredentialRef]: sshPassword },
   })
 
   let stdout = ''
@@ -309,10 +345,49 @@ async function main() {
       const wslAfter = await awaitPhase(base, cookie, 'm1-wsl', 'stopped', 30_000)
       check('WSL 实例回到 stopped', wslAfter?.phase === 'stopped', String(wslAfter?.phase))
     }
+
+    /* ── M2：SSH 实例（测试对端，真实 SSH 协议） ── */
+    if (sshMode) {
+      console.log('\n[M2] SSH 实例：连接 → 认证 → 远端 exec → 隧道镜像 → 停止')
+      let sshStarted
+      try {
+        sshStarted = await post(`${base}/remote-desks/api/instances/m2-ssh/start`, { cookie })
+      } catch (error) {
+        check('SSH POST start 未把宿主连接打断', false, error instanceof Error ? error.message : String(error))
+        sshStarted = undefined
+      }
+      if (sshStarted !== undefined) {
+        check('SSH POST start → 200', sshStarted.status === 200, String(sshStarted.status))
+        const running = await verifyMirror(base, cookie, 'm2-ssh')
+        if (running?.phase === 'running') {
+          check('上游是 SSH 隧道', String(running.upstream ?? '').includes('ssh-forward'), String(running.upstream))
+        }
+        const sshLogs = await get(`${base}/remote-desks/api/instances/m2-ssh/logs?offset=0`, { cookie }).catch(
+          () => ({ text: '{}' }),
+        )
+        const lines = JSON.parse(sshLogs.text)?.lines ?? []
+        check('日志里有 SSH 连接', lines.some((line) => line.includes('SSH 已连接')), lines.slice(0, 3).join(' | '))
+        check('日志里记了主机密钥指纹', lines.some((line) => line.includes('SHA256:')), '')
+        await post(`${base}/remote-desks/api/instances/m2-ssh/stop`, { cookie }).catch(() => undefined)
+        const sshAfter = await awaitPhase(base, cookie, 'm2-ssh', 'stopped', 30_000)
+        check('SSH 实例回到 stopped', sshAfter?.phase === 'stopped', String(sshAfter?.phase))
+      }
+    }
   } finally {
+    if (failures.length > 0) {
+      const tail = stderr.trim().split('\n').slice(-18).join('\n  ')
+      console.log(`  (宿主 stderr 末尾)\n  ${tail === '' ? '（空）' : tail}`)
+      const outTail = stdout.trim().split('\n').slice(-6).join('\n  ')
+      console.log(`  (宿主 stdout 末尾)\n  ${outTail === '' ? '（空）' : outTail}`)
+    }
     child.kill('SIGTERM')
     await wait(1500)
     if (child.exitCode === null) child.kill('SIGKILL')
+    if (sshServer !== undefined) {
+      sshServer.kill('SIGTERM')
+      await wait(300)
+      if (sshServer.exitCode === null) sshServer.kill('SIGKILL')
+    }
     if (!keepProfile) {
       for (const dir of [profileDir, join(dshHome, 'profiles', localInstanceProfile), join(dshHome, 'profiles', wslInstanceProfile)]) {
         try {

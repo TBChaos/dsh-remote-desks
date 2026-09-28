@@ -410,6 +410,74 @@ check('POST start 冲突 → 409', conflict.statusCode === 409, String(conflict.
 check('未知动作 → 404', call5('POST', '/remote-desks/api/instances/a/explode').statusCode === 404)
 check('GET 方法打 start → 404', call5('GET', '/remote-desks/api/instances/a/start').statusCode === 404)
 
+/* ── 6. SSH 层 ── */
+
+console.log('\n[6] SSH 层（纯函数与适配器）')
+const { createHash } = await import('node:crypto')
+const { Duplex } = await import('node:stream')
+const sshManager = await import(pathToFileURL(resolve(root, 'lib/ssh/manager.js')).href)
+const spec = await import(pathToFileURL(resolve(root, 'lib/instances/spec.js')).href)
+const upstream = await import(pathToFileURL(resolve(root, 'lib/mirror/upstream.js')).href)
+
+const expected = `SHA256:${createHash('sha256').update('abc').digest('base64').replace(/=+$/, '')}`
+check('主机密钥指纹格式', sshManager.fingerprintOf(Buffer.from('abc')) === expected, sshManager.fingerprintOf(Buffer.from('abc')))
+
+// 非 net.Socket 的字节流要能被 http 客户端接受（缺 setTimeout 会把宿主进程搞崩）
+const plain = new Duplex({ read() {}, write(_chunk, _enc, done) {
+  done()
+} })
+check('裸 Duplex 缺 setTimeout', typeof plain.setTimeout !== 'function')
+const shimmed = upstream.asSocket(plain)
+check('asSocket 补上 setTimeout', typeof shimmed.setTimeout === 'function')
+check('asSocket 补上 setNoDelay', typeof shimmed.setNoDelay === 'function')
+check('asSocket 补上 address', typeof shimmed.address === 'function' && shimmed.address()?.port === 0)
+check('asSocket 返回同一个对象', shimmed === plain)
+const realSocket = new (await import('node:net')).Socket()
+check('asSocket 对真 socket 不动手脚', upstream.asSocket(realSocket) === realSocket)
+
+const command = spec.posixDshCommand('mirror-x', '/home/me/proj')
+check('远端命令是单行', !command.includes('\n'))
+check('远端命令不做变量赋值', !/(^|;\s*)[A-Za-z_][A-Za-z0-9_]*=/.test(command), command.slice(0, 80))
+check('远端命令不含双引号', !command.includes('"'))
+check('远端命令会初始化 profile', command.includes('package.json') && command.includes('base64 -d'))
+check('远端命令处理 nvm', command.includes('nvm.sh'))
+check('远端命令缺 dsh 时报错退出', command.includes('exit 127'))
+check('远端命令用 exec 起 dsh', command.includes('exec dsh --profile mirror-x --port 0 --no-open'))
+check('远端命令带上 cwd', command.includes(`cd '/home/me/proj'`))
+
+const encodedPayload = /printf '%s' '([A-Za-z0-9+/=]+)'/.exec(command)?.[1]
+let manifest
+try {
+  manifest = JSON.parse(Buffer.from(encodedPayload ?? '', 'base64').toString('utf8'))
+} catch {
+  manifest = undefined
+}
+check('base64 里的 profile 清单可解析', manifest !== undefined)
+check('清单声明了两个 bundle', Array.isArray(manifest?.dsh?.profile?.bundles) && manifest.dsh.profile.bundles.length === 2)
+
+let sshMissingHost = false
+try {
+  spec.sshSpec({ id: 'x', kind: 'ssh', enabled: true, jumpHosts: [] })
+} catch {
+  sshMissingHost = true
+}
+check('sshSpec 缺 host 时报错', sshMissingHost)
+const sshPlan = spec.planFor(
+  { id: 'x', kind: 'ssh', enabled: true, host: 'h.example', username: 'u', jumpHosts: [] },
+  undefined,
+  'C:/dsh',
+)
+check('planFor 把 ssh 分到 ssh 传输', sshPlan.transport === 'ssh', sshPlan.transport)
+check('ssh 计划不需要本机发行版', sshPlan.transport === 'ssh' && sshPlan.describe.includes('h.example'))
+
+const connection = new sshManager.SshConnection({
+  target: { host: 'h.example', port: 2222, username: 'deploy', auth: { method: 'agent' } },
+  jumpHosts: [{ host: 'jump.example', port: 22, username: 'ops' }],
+  resolveCredential: async () => undefined,
+  log: () => {},
+})
+check('SSH 描述含跳板链', connection.describe().includes('jump.example') && connection.describe().includes('h.example'), connection.describe())
+
 /* ── 汇总 ── */
 
 console.log('')

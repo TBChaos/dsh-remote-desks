@@ -44,6 +44,8 @@ export interface RemoteDeskInstance {
   username?: string
   auth?: RemoteDeskAuth
   jumpHosts: RemoteDeskJumpHost[]
+  /** 已知主机密钥指纹（SHA256 base64）；留空则接受并打印指纹（TOFU）。 */
+  hostKeyFingerprint?: string
   /** 覆盖启动命令（留空则按 kind 推导）。 */
   launchCommand?: string
   /** 覆盖更新命令（更新功能尚未启用，先保留字段）。 */
@@ -112,6 +114,7 @@ const Instance = Schema.object({
   username: Schema.string(),
   auth: Auth,
   jumpHosts: Schema.array(JumpHost).default([]),
+  hostKeyFingerprint: Schema.string(),
 
   launchCommand: Schema.string(),
   updateCommand: Schema.string(),

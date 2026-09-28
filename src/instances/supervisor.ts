@@ -1,17 +1,18 @@
 import { connect } from 'node:net'
 
 import { MirrorEndpoint } from '../mirror/endpoint.js'
-import { tcpUpstream, type UpstreamConnector } from '../mirror/upstream.js'
+import { asSocket, sshUpstream, tcpUpstream, type UpstreamConnector } from '../mirror/upstream.js'
 import type { RemoteDeskInstance } from '../config.js'
+import { SshConnection } from '../ssh/manager.js'
+import { sshProcessHandle } from '../ssh/process.js'
 import { exchangeSession, findReadyUrl } from './readiness.js'
-import { localSpec, wslSpec } from './spec.js'
+import { planFor } from './spec.js'
 import {
   instanceById,
   labelOf,
   type InstanceConfigSource,
   type InstancePhase,
   type InstanceSnapshot,
-  type LaunchSpec,
   type SupervisorDeps,
 } from './types.js'
 
@@ -48,6 +49,8 @@ const PROBE_TIMEOUT_MS = 4_000
 
 interface Runtime {
   handle?: SubprocessHandleLike
+  /** SSH 实例的连接（控制面与数据面共用一条）。 */
+  ssh?: SshConnection
   endpoint?: MirrorEndpoint
   cookie?: string
   remotePort?: number
@@ -136,7 +139,10 @@ export class InstanceSupervisor {
     if (!instance.enabled) throw new Error(`实例 ${id} 已禁用（enabled: false）`)
 
     const subprocess = this.subprocess()
-    if (subprocess === undefined) throw new Error('宿主没有提供 subprocess 服务，无法启动实例')
+    const localTransport = instance.kind !== 'ssh'
+    if (localTransport && subprocess === undefined) {
+      throw new Error('宿主没有提供 subprocess 服务，无法启动本机 / WSL 实例')
+    }
 
     runtime.busy = true
     this.setPhase(runtime, 'starting', '正在拉起实例')
@@ -144,15 +150,36 @@ export class InstanceSupervisor {
     runtime.exit = undefined
 
     try {
-      const spec = this.buildSpec(instance)
-      this.append(runtime, `启动：${spec.describe}`)
-      const handle = subprocess.spawn({
-        argv: spec.argv,
-        cwd: spec.cwd,
-        stdio: { stdin: 'ignore', stdout: { maxBytes: 512 * 1024 }, stderr: { maxBytes: 512 * 1024 } },
-        graceMs: 5_000,
-        env: spec.env as NodeJS.ProcessEnv,
-      })
+      const plan = planFor(instance, this.deps.localRuntime(), this.deps.dshHome)
+      let handle: SubprocessHandleLike
+      if (plan.transport === 'ssh') {
+        this.append(runtime, `启动：${plan.describe}`)
+        const ssh = new SshConnection({
+          target: {
+            host: instance.host ?? '',
+            port: instance.port ?? 22,
+            username: instance.username ?? '',
+            auth: instance.auth ?? { method: 'agent' },
+          },
+          jumpHosts: instance.jumpHosts,
+          resolveCredential: this.deps.resolveCredential,
+          log: (message) => this.append(runtime, message),
+          ...(instance.hostKeyFingerprint === undefined ? {} : { hostKeyFingerprint: instance.hostKeyFingerprint }),
+        })
+        runtime.ssh = ssh
+        handle = sshProcessHandle(await ssh.exec(plan.command))
+      } else {
+        const spec = plan.spec
+        this.append(runtime, `启动：${spec.describe}`)
+        if (subprocess === undefined) throw new Error('宿主没有提供 subprocess 服务')
+        handle = subprocess.spawn({
+          argv: spec.argv,
+          cwd: spec.cwd,
+          stdio: { stdin: 'ignore', stdout: { maxBytes: 512 * 1024 }, stderr: { maxBytes: 512 * 1024 } },
+          graceMs: 5_000,
+          env: spec.env as NodeJS.ProcessEnv,
+        })
+      }
       runtime.handle = handle
 
       void handle.done.then((outcome) => {
@@ -184,7 +211,18 @@ export class InstanceSupervisor {
       runtime.readyUrl = readyUrl
       runtime.remotePort = remotePort
 
-      const exchanged = await exchangeSession(readyUrl)
+      const exchanged = await exchangeSession(
+        readyUrl,
+        runtime.ssh === undefined
+          ? {}
+          : {
+              connect: async () =>
+                runtime.ssh === undefined
+                  ? await Promise.reject(new Error('SSH 连接已释放'))
+                  : asSocket(await runtime.ssh.forwardOut('127.0.0.1', remotePort)),
+              remotePort,
+            },
+      )
       this.append(runtime, `会话换取：${exchanged.detail}`)
       if (!exchanged.ok || exchanged.cookie === undefined) {
         const reason = `实例起来了，但没能换取会话 cookie：${exchanged.detail}`
@@ -243,6 +281,8 @@ export class InstanceSupervisor {
         this.append(runtime, exited ? '实例进程已退出' : '实例进程未在宽限期内退出')
       }
       runtime.handle = undefined
+      await runtime.ssh?.dispose()
+      runtime.ssh = undefined
       runtime.cookie = undefined
       runtime.readyUrl = undefined
       runtime.remotePort = undefined
@@ -292,24 +332,13 @@ export class InstanceSupervisor {
     return created
   }
 
-  private buildSpec(instance: RemoteDeskInstance): LaunchSpec {
-    if (instance.kind === 'local') {
-      const runtime = this.deps.localRuntime()
-      if (runtime === undefined) {
-        throw new Error('找不到本机 DSH 发行版入口，无法启动本机实例（可用 config.entry 指定）')
-      }
-      return localSpec(instance, runtime, this.deps.dshHome)
-    }
-    if (instance.kind === 'wsl') return wslSpec(instance)
-    throw new Error(`SSH 实例的数据面在 M2 落地：${instance.id}`)
-  }
-
   /**
    * 选上游连接方式。
    *
-   * 本机直连即可。WSL 要先确认 Windows 能不能直连发行版里绑 127.0.0.1 的端口：
-   * 镜像网络模式下可以（本机实测可以），默认 NAT 模式下不行——那时给出明确诊断，
-   * 而不是留一个永远连不上的镜像。
+   * - 本机：直连回环端口。
+   * - SSH：每条上游连接一条 `direct-tcpip` 通道，远端不用开端口。
+   * - WSL：先确认 Windows 能不能直连发行版里绑 127.0.0.1 的端口（镜像网络模式可以，
+   *   默认 NAT 不行），不通就给明确诊断，而不是留一个永远连不上的镜像。
    */
   private async connectorFor(
     instance: RemoteDeskInstance,
@@ -317,6 +346,11 @@ export class InstanceSupervisor {
     runtime: Runtime,
   ): Promise<UpstreamConnector> {
     if (instance.kind === 'local') return tcpUpstream('127.0.0.1', remotePort, 'local')
+    if (instance.kind === 'ssh') {
+      const ssh = runtime.ssh
+      if (ssh === undefined) throw new Error('SSH 连接不存在，无法建立数据面')
+      return sshUpstream(ssh, remotePort)
+    }
 
     const reachable = await probeTcp('127.0.0.1', remotePort)
     this.append(

@@ -135,6 +135,16 @@ export function apply(ctx: RemoteDesksHostContext, config: RemoteDesksConfig): v
         if (!runtime.found || runtime.entry === undefined) return undefined
         return { entry: runtime.entry, execPath: process.execPath, electron: process.versions.electron !== undefined }
       },
+      resolveCredential: async (name): Promise<string | undefined> => {
+        const credentials = ctx.get('credentials') as
+          | { resolve(ref: string): Promise<{ value: string } | undefined> }
+          | undefined
+        if (credentials === undefined || typeof credentials.resolve !== 'function') {
+          throw new Error(`宿主没有提供 credentials 服务，无法解析凭据 ${name}`)
+        }
+        const resolved = await credentials.resolve(name)
+        return resolved?.value
+      },
       log: (message) => ctx.logger?.info?.(message),
     },
     subprocess,
