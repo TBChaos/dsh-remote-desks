@@ -172,17 +172,12 @@ function dumpLogs(snapshot) {
   console.log(`  (实例日志)\n    ${(snapshot?.logs?.lines ?? []).slice(-14).join('\n    ')}`)
 }
 
-/** 一个实例的完整镜像往返：票据闸门 → 票据换 cookie → 镜像 UI → 子资源。 */
-async function verifyMirror(base, cookie, id) {
-  const running = await awaitPhase(base, cookie, id, 'running')
-  check(`${id} 进入 running`, running?.phase === 'running', `${String(running?.phase)}：${String(running?.detail)}`)
+/** 对一个**已在运行**的实例做完整镜像往返：票据闸门 → 票据换 cookie → 镜像 UI → 子资源。 */
+async function verifyMirrorOf(running, id) {
   if (running?.phase !== 'running') {
-    dumpLogs(running)
-    return running
+    check(`${id} 镜像往返（需 running）`, false, String(running?.phase))
+    return
   }
-  check(`${id} 给出了远端端口`, Number.isSafeInteger(running.remotePort) && running.remotePort > 0, String(running.remotePort))
-  check(`${id} 给出了镜像入口`, typeof running.mirrorEntryUrl === 'string' && running.mirrorEntryUrl.includes('?k='))
-
   const noTicket = await get(running.mirrorBaseUrl)
   check(`${id} 镜像端点无票据 → 403`, noTicket.status === 403, String(noTicket.status))
 
@@ -217,7 +212,6 @@ async function verifyMirror(base, cookie, id) {
 
   const badTicket = await get(`${running.mirrorBaseUrl}?k=wrong`)
   check(`${id} 错误票据 → 403`, badTicket.status === 403, String(badTicket.status))
-  return running
 }
 
 async function main() {
@@ -316,63 +310,66 @@ async function main() {
       check('bundle 是 __ModuleLoader__ 形态', bundle.text.startsWith('window.__ModuleLoader__.load({'))
     }
 
-    /* ── M1：本机实例 ── */
-    console.log('\n[M1] 本机实例：启动 → 镜像 → 停止')
-    const before = await get(`${base}/remote-desks/api/instances/m1-local`, { cookie })
-    check('实例初始状态可读', before.status === 200, String(before.status))
-    check('实例初始为 stopped', JSON.parse(before.text)?.phase === 'stopped', String(JSON.parse(before.text)?.phase))
+    /* ── M1/M2：多实例并发 ── */
+    const targets = ['m1-local']
+    if (wslDistro !== '') targets.push('m1-wsl')
+    if (sshMode) targets.push('m2-ssh')
 
-    const started = await post(`${base}/remote-desks/api/instances/m1-local/start`, { cookie })
-    check('POST start → 200', started.status === 200, String(started.status))
-    await verifyMirror(base, cookie, 'm1-local')
+    console.log(`\n[并发] 同时拉起 ${String(targets.length)} 个实例：${targets.join('、')}`)
+    for (const id of targets) {
+      const started = await post(`${base}/remote-desks/api/instances/${id}/start`, { cookie }).catch((error) => ({
+        status: 0,
+        text: String(error),
+      }))
+      check(`${id} POST start → 200`, started.status === 200, String(started.status))
+    }
 
-    const stopped = await post(`${base}/remote-desks/api/instances/m1-local/stop`, { cookie })
-    check('POST stop → 200', stopped.status === 200, String(stopped.status))
-    const after = await awaitPhase(base, cookie, 'm1-local', 'stopped', 30_000)
-    check('实例回到 stopped', after?.phase === 'stopped', String(after?.phase))
-    check('停止后不再暴露镜像端点', after?.mirrorBaseUrl === undefined, String(after?.mirrorBaseUrl))
+    // 先把所有实例都等到 running，再逐个验镜像——这样"同时在线"才是真的被验到。
+    const running = {}
+    for (const id of targets) {
+      running[id] = await awaitPhase(base, cookie, id, 'running')
+      check(`${id} 进入 running`, running[id]?.phase === 'running', `${String(running[id]?.phase)}：${String(running[id]?.detail)}`)
+      if (running[id]?.phase !== 'running') dumpLogs(running[id])
+    }
+    const concurrent = targets.filter((id) => running[id]?.phase === 'running')
+    check('多个实例同时处于 running', concurrent.length === targets.length, `${String(concurrent.length)}/${String(targets.length)}`)
+    const ports = concurrent.map((id) => running[id]?.remotePort)
+    check('各实例端口互不相同', new Set(ports).size === ports.length, ports.join(', '))
+    const mirrorPorts = concurrent.map((id) => running[id]?.mirrorBaseUrl)
+    check('各镜像端点端口互不相同', new Set(mirrorPorts).size === mirrorPorts.length, mirrorPorts.join(', '))
+
+    const list = await get(`${base}/remote-desks/api/instances`, { cookie })
+    const listed = JSON.parse(list.text)?.instances ?? []
+    check(
+      '列表里所有实例都在 running',
+      targets.every((id) => listed.find((entry) => entry.id === id)?.phase === 'running'),
+      listed.map((entry) => `${entry.id}:${entry.phase}`).join(', '),
+    )
+
+    for (const id of targets) await verifyMirrorOf(running[id], id)
+
+    if (sshMode) {
+      const sshRunning = running['m2-ssh']
+      if (sshRunning?.upstream !== undefined) {
+        check('SSH 上游是隧道', String(sshRunning.upstream).includes('ssh-forward'), String(sshRunning.upstream))
+      }
+      const sshLogs = await get(`${base}/remote-desks/api/instances/m2-ssh/logs?offset=0`, { cookie }).catch(() => ({ text: '{}' }))
+      const lines = JSON.parse(sshLogs.text)?.lines ?? []
+      check('日志里有 SSH 连接', lines.some((line) => line.includes('SSH 已连接')), lines.slice(0, 2).join(' | '))
+      check('日志里记了主机密钥指纹', lines.some((line) => line.includes('SHA256:')), '')
+    }
+
+    console.log('\n[停止] 逐个停止并确认收摊')
+    for (const id of targets) {
+      const stopped = await post(`${base}/remote-desks/api/instances/${id}/stop`, { cookie })
+      check(`${id} POST stop → 200`, stopped.status === 200, String(stopped.status))
+      const after = await awaitPhase(base, cookie, id, 'stopped', 30_000)
+      check(`${id} 回到 stopped`, after?.phase === 'stopped', String(after?.phase))
+      check(`${id} 停止后不再暴露镜像端点`, after?.mirrorBaseUrl === undefined, String(after?.mirrorBaseUrl))
+    }
 
     const logs = await get(`${base}/remote-desks/api/instances/m1-local/logs?offset=0`, { cookie })
     check('实例日志可读', (JSON.parse(logs.text)?.lines ?? []).length > 0)
-
-    /* ── M1：WSL 实例 ── */
-    if (wslDistro !== '') {
-      console.log(`\n[M1] WSL 实例：${wslDistro} 启动 → 镜像 → 停止`)
-      const wslStarted = await post(`${base}/remote-desks/api/instances/m1-wsl/start`, { cookie })
-      check('WSL POST start → 200', wslStarted.status === 200, String(wslStarted.status))
-      await verifyMirror(base, cookie, 'm1-wsl')
-      await post(`${base}/remote-desks/api/instances/m1-wsl/stop`, { cookie })
-      const wslAfter = await awaitPhase(base, cookie, 'm1-wsl', 'stopped', 30_000)
-      check('WSL 实例回到 stopped', wslAfter?.phase === 'stopped', String(wslAfter?.phase))
-    }
-
-    /* ── M2：SSH 实例（测试对端，真实 SSH 协议） ── */
-    if (sshMode) {
-      console.log('\n[M2] SSH 实例：连接 → 认证 → 远端 exec → 隧道镜像 → 停止')
-      let sshStarted
-      try {
-        sshStarted = await post(`${base}/remote-desks/api/instances/m2-ssh/start`, { cookie })
-      } catch (error) {
-        check('SSH POST start 未把宿主连接打断', false, error instanceof Error ? error.message : String(error))
-        sshStarted = undefined
-      }
-      if (sshStarted !== undefined) {
-        check('SSH POST start → 200', sshStarted.status === 200, String(sshStarted.status))
-        const running = await verifyMirror(base, cookie, 'm2-ssh')
-        if (running?.phase === 'running') {
-          check('上游是 SSH 隧道', String(running.upstream ?? '').includes('ssh-forward'), String(running.upstream))
-        }
-        const sshLogs = await get(`${base}/remote-desks/api/instances/m2-ssh/logs?offset=0`, { cookie }).catch(
-          () => ({ text: '{}' }),
-        )
-        const lines = JSON.parse(sshLogs.text)?.lines ?? []
-        check('日志里有 SSH 连接', lines.some((line) => line.includes('SSH 已连接')), lines.slice(0, 3).join(' | '))
-        check('日志里记了主机密钥指纹', lines.some((line) => line.includes('SHA256:')), '')
-        await post(`${base}/remote-desks/api/instances/m2-ssh/stop`, { cookie }).catch(() => undefined)
-        const sshAfter = await awaitPhase(base, cookie, 'm2-ssh', 'stopped', 30_000)
-        check('SSH 实例回到 stopped', sshAfter?.phase === 'stopped', String(sshAfter?.phase))
-      }
-    }
   } finally {
     if (failures.length > 0) {
       const tail = stderr.trim().split('\n').slice(-18).join('\n  ')

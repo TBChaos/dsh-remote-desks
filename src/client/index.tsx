@@ -215,6 +215,43 @@ function useInstances(): { instances: InstanceSnapshot[]; error?: string; refres
   return { instances, ...(error === undefined ? {} : { error }), refresh: load, act }
 }
 
+/** 增量拉某个实例的日志；offset 从 0 开始，之后只取新增部分。 */
+function useInstanceLogs(id: string | undefined, enabled: boolean): { lines: string[]; clear: () => void } {
+  const [lines, setLines] = useState<string[]>([])
+  const offsetRef = useRef(0)
+
+  useEffect(() => {
+    offsetRef.current = 0
+    setLines([])
+    if (id === undefined || !enabled) return
+    let alive = true
+    const tick = async (): Promise<void> => {
+      try {
+        const response = await fetch(
+          `${INSTANCES_URL}/${encodeURIComponent(id)}/logs?offset=${String(offsetRef.current)}`,
+          { headers: { accept: 'application/json' } },
+        )
+        if (!response.ok) return
+        const body = (await response.json()) as { nextOffset?: number; lines?: string[] }
+        if (!alive) return
+        offsetRef.current = body.nextOffset ?? offsetRef.current
+        const fresh = body.lines ?? []
+        if (fresh.length > 0) setLines((current) => [...current, ...fresh].slice(-400))
+      } catch {
+        /* 下一轮再试 */
+      }
+    }
+    void tick()
+    const timer = setInterval(() => void tick(), POLL_INTERVAL_MS)
+    return () => {
+      alive = false
+      clearInterval(timer)
+    }
+  }, [id, enabled])
+
+  return { lines, clear: useCallback(() => setLines([]), []) }
+}
+
 /* ── 镜像容器：桌面走官方 webview lease，其余降级 ── */
 
 type CarrierMode = 'pending' | 'webview' | 'iframe' | 'failed'
@@ -330,6 +367,7 @@ function Panel(): ReactNode {
 
   const active = instances.find((instance) => instance.id === selected) ?? instances[0]
   const open = active?.phase === 'running' && typeof active.mirrorEntryUrl === 'string' ? active.mirrorEntryUrl : undefined
+  const logs = useInstanceLogs(active?.id, active !== undefined && active.phase !== 'stopped')
 
   const run = async (id: string, action: 'start' | 'stop' | 'restart'): Promise<void> => {
     setBusy(`${id}:${action}`)
@@ -435,14 +473,44 @@ function Panel(): ReactNode {
                 <MirrorStage entryUrl={open} label={active.label} />
               )}
 
-              {active.logs.lines.length === 0 ? null : (
-                <pre className="drd-logs">{active.logs.lines.slice(-8).join('\n')}</pre>
-              )}
+              <LogDrawer lines={logs.lines} onClear={logs.clear} />
             </>
           )}
         </div>
       </div>
     </div>
+  )
+}
+
+/** 日志抽屉：默认折叠，标题行显示条数；展开后自动贴底。 */
+function LogDrawer({ lines, onClear }: { lines: string[]; onClear: () => void }): ReactNode {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLPreElement | null>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const node = ref.current
+    if (node !== null) node.scrollTop = node.scrollHeight
+  }, [lines, open])
+
+  return (
+    <>
+      <div className="drd-toolbar" style={{ borderTop: '1px solid var(--dsw-alias-border-l1, currentColor)', borderBottom: 'none' }}>
+        <button type="button" className="drd-btn" onClick={() => setOpen((value) => !value)}>
+          {open ? '收起日志' : `展开日志（${String(lines.length)} 行）`}
+        </button>
+        {open && lines.length > 0 ? (
+          <button type="button" className="drd-btn" onClick={onClear}>
+            清屏
+          </button>
+        ) : null}
+      </div>
+      {open ? (
+        <pre className="drd-logs" ref={ref} style={{ maxHeight: '240px' }}>
+          {lines.length === 0 ? '（还没有日志）' : lines.join('\n')}
+        </pre>
+      ) : null}
+    </>
   )
 }
 
