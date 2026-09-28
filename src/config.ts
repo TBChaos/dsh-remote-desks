@@ -50,6 +50,8 @@ export interface RemoteDeskInstance {
   launchCommand?: string
   /** 覆盖更新命令（更新功能尚未启用，先保留字段）。 */
   updateCommand?: string
+  /** 等就绪行的上限（毫秒）；慢速远端可以调大。默认 90000。 */
+  readyTimeoutMs?: number
 }
 
 export type MirrorOpenMode = 'auto' | 'webview' | 'rightbar' | 'iframe' | 'browser'
@@ -116,6 +118,7 @@ const Instance = Schema.object({
 
   launchCommand: Schema.string(),
   updateCommand: Schema.string(),
+  readyTimeoutMs: Schema.natural(),
 })
 
 export const Config: Schema<RemoteDesksConfig> = Schema.object({

@@ -53,6 +53,8 @@ dsh plugin --profile desktop add <本目录路径>
         distro: Ubuntu-24.04
         user: you
         cwd: /home/you/project
+        # 慢速远端可以调大等就绪行的上限（毫秒，默认 90000）
+        # readyTimeoutMs: 180000
       - id: local-dev
         kind: local
         profile: mirror-local-dev
@@ -238,6 +240,10 @@ node scripts/verify-live.mjs \
 index 的 `window.__DSH_BOOT__` 里出现本插件的行 → 取到 `__ModuleLoader__` 形态的客户端 bundle；
 然后对**每一个**实例：启动 → 就绪 → 无票据 403 → 票据换 cookie 302 → **镜像 UI 200** →
 镜像里的子资源 200 → 停止 → 端点收摊。跑完自动清理 profile（`--keep-profile` 可保留）。
+
+它还带两个**故意坏掉**的实例，专门盯失败路径：入口文件不存在的本机实例（进程退出 → `error`
+→ 有可读原因 → 不暴露端点 → **仍可重试**），以及永不打印就绪行的 WSL 实例（按
+`readyTimeoutMs` 超时 → `error` → "等待就绪行超时"）。
 
 **第三道 · 装进桌面版**：`dsh-remote-desks` 已装入 desktop profile，`dsh.bundle.patch` 会把
 `remote-desks` 行插进 Loader 树。桌面版是**启动型 profile**，加载新 bundle 行需要**重启一次

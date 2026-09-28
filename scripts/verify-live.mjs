@@ -67,9 +67,26 @@ function prepareProfile() {
     `        kind: local`,
     `        profile: ${localInstanceProfile}`,
     `        cwd: ${JSON.stringify(root)}`,
+    // 故意坏掉的实例：入口文件不存在，启动必然失败（用来验失败路径与可重试性）。
+    `      - id: bad-entry`,
+    `        kind: local`,
+    `        label: 入口不存在`,
+    `        entry: C:\\\\definitely-not-here\\\\dsh\\\\lib\\\\bin.js`,
+    `        profile: mirror-bad-entry`,
+    `        cwd: ${JSON.stringify(root)}`,
+    `        readyTimeoutMs: 6000`,
   ]
   if (wslDistro !== '') {
     instances.push(`      - id: m1-wsl`, `        kind: wsl`, `        distro: ${wslDistro}`, `        cwd: /home/zmh`)
+    // 故意不打印就绪行的实例：验就绪超时路径（readyTimeoutMs 调小以免拖慢验证）。
+    instances.push(
+      `      - id: slow-wsl`,
+      `        kind: wsl`,
+      `        label: 永不就绪`,
+      `        distro: ${wslDistro}`,
+      `        launchCommand: sleep 60`,
+      `        readyTimeoutMs: 4000`,
+    )
   }
   if (sshMode) {
     instances.push(
@@ -338,6 +355,40 @@ async function main() {
     }
     const unknown = await get(`${base}/remote-desks/api/instances/nope/check`, { cookie })
     check('预检未知实例 → 404', unknown.status === 404, String(unknown.status))
+
+    /* ── 失败路径：起不来时要给出可读的原因，而且必须能重试 ── */
+    console.log('\n[失败路径] 故意坏掉的实例')
+    const badStarted = await post(`${base}/remote-desks/api/instances/bad-entry/start`, { cookie })
+    check('坏实例 start 请求本身成功返回', badStarted.status === 200, String(badStarted.status))
+    const badState = await awaitPhase(base, cookie, 'bad-entry', 'error', 30_000)
+    check('坏实例进入 error', badState?.phase === 'error', String(badState?.phase))
+    check(
+      '坏实例给出可读原因',
+      typeof badState?.error === 'string' && badState.error.length > 0,
+      String(badState?.error),
+    )
+    check('坏实例不暴露镜像端点', badState?.mirrorBaseUrl === undefined, String(badState?.mirrorBaseUrl))
+    check(
+      '坏实例日志里有失败记录',
+      (badState?.logs?.lines ?? []).some((line) => line.includes('意外退出') || line.includes('启动失败')),
+      (badState?.logs?.lines ?? []).slice(-3).join(' | '),
+    )
+    // 关键：一次失败不能把实例锁死（busy 泄漏过一次就再也好不了）。
+    const retry = await post(`${base}/remote-desks/api/instances/bad-entry/start`, { cookie })
+    check('失败后仍可重试（不是 409）', retry.status === 200, String(retry.status))
+
+    if (wslDistro !== '') {
+      const slowStarted = await post(`${base}/remote-desks/api/instances/slow-wsl/start`, { cookie })
+      check('慢实例 start 请求成功返回', slowStarted.status === 200, String(slowStarted.status))
+      const slowState = await awaitPhase(base, cookie, 'slow-wsl', 'error', 60_000)
+      check('慢实例按 readyTimeoutMs 超时进入 error', slowState?.phase === 'error', String(slowState?.phase))
+      check(
+        '超时原因写着超时',
+        String(slowState?.error ?? '').includes('超时'),
+        String(slowState?.error),
+      )
+      check('慢实例不暴露镜像端点', slowState?.mirrorBaseUrl === undefined, String(slowState?.mirrorBaseUrl))
+    }
 
     /* ── 并发启动 ── */
     console.log(`\n[并发] 同时拉起 ${String(targets.length)} 个实例：${targets.join('、')}`)

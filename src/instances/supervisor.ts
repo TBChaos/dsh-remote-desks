@@ -204,24 +204,39 @@ export class InstanceSupervisor {
       }
       runtime.handle = handle
 
-      void handle.done.then((outcome) => {
-        runtime.exit = { code: outcome.exitCode, signal: outcome.signal }
-        if (runtime.phase === 'stopping' || runtime.phase === 'stopped') return
-        if (runtime.phase === 'running' || runtime.phase === 'starting') {
-          runtime.error = '进程意外退出'
-          this.setPhase(
-            runtime,
-            'error',
-            `实例进程意外退出（code=${String(outcome.exitCode)} signal=${String(outcome.signal)}）`,
-          )
-          void this.teardownEndpoint(runtime)
-        }
-      })
+      // done 可能**拒绝**（spawn 本身失败，例如入口文件不存在）。没有第二个回调
+      // 就是一个未处理的 Promise 拒绝——实测这类东西足以把宿主带走。
+      void handle.done.then(
+        (outcome) => {
+          runtime.exit = { code: outcome.exitCode, signal: outcome.signal }
+          if (runtime.phase === 'stopping' || runtime.phase === 'stopped') return
+          if (runtime.phase === 'running' || runtime.phase === 'starting') {
+            const reason = `实例进程意外退出（code=${String(outcome.exitCode)} signal=${String(outcome.signal)}）`
+            runtime.error = '进程意外退出'
+            this.setPhase(runtime, 'error', reason)
+            // 写进日志环：面板的日志抽屉要能直接显示原因，而不是只留一堆 stderr。
+            this.append(runtime, reason)
+            void this.teardownEndpoint(runtime)
+          }
+        },
+        (error: unknown) => {
+          const reason = `实例进程启动失败：${describeError(error)}`
+          this.append(runtime, reason)
+          // 让等就绪行的循环立刻收手，而不是干等到超时。
+          runtime.exit = { code: null, signal: null }
+          if (runtime.phase === 'starting' || runtime.phase === 'running') {
+            runtime.error = reason
+            this.setPhase(runtime, 'error', reason)
+            void this.teardownEndpoint(runtime)
+          }
+        },
+      )
 
       this.startLogPump(runtime, handle)
-      const readyUrl = await this.awaitReadyUrl(runtime)
+      const readyUrl = await this.awaitReadyUrl(runtime, instance.readyTimeoutMs ?? READY_TIMEOUT_MS)
       if (readyUrl === undefined) {
-        const reason = runtime.error ?? `等待就绪行超时（${String(READY_TIMEOUT_MS / 1000)} 秒）`
+        const limit = instance.readyTimeoutMs ?? READY_TIMEOUT_MS
+        const reason = runtime.error ?? `等待就绪行超时（${String(Math.round(limit / 1000))} 秒）`
         runtime.error = reason
         this.setPhase(runtime, 'error', reason)
         this.stopLogPump(runtime)
@@ -439,8 +454,8 @@ export class InstanceSupervisor {
     return tcpUpstream('127.0.0.1', remotePort, 'local')
   }
 
-  private async awaitReadyUrl(runtime: Runtime): Promise<string | undefined> {
-    const deadline = Date.now() + READY_TIMEOUT_MS
+  private async awaitReadyUrl(runtime: Runtime, timeoutMs = READY_TIMEOUT_MS): Promise<string | undefined> {
+    const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {
       await delay(POLL_INTERVAL_MS)
       if (runtime.exit !== undefined) return undefined
