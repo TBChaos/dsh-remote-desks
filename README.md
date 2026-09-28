@@ -125,13 +125,13 @@ mirror:
 
 `openMode` 决定镜像用哪种容器承载，四种取值都真的生效（不是解析完就放着）：
 
-| 取值 | 行为 |
-|---|---|
-| `auto`（默认） | 桌面走官方 webview lease → 失败退内嵌框架 → 再退系统浏览器 |
-| `webview` | 强制桌面原生视图；不可用时说明原因并退回内嵌框架 |
-| `iframe` | 跳过 webview，直接用内嵌框架（纯 Web 版等价形态） |
-| `browser` | 不做内嵌，直接交给系统浏览器打开 |
-| `rightbar` | 走**官方右栏浏览器标签**（`ctx.sidebarRight.openTab('browser', …)` + 全屏右栏），宿主没启用该插件时退回内嵌框架 |
+| 取值 | 行为 | 真机验证 |
+|---|---|---|
+| `auto`（默认） | 桌面走官方 webview lease → 失败退内嵌框架 → 再退系统浏览器 | ✅ 浏览器里实测走 iframe |
+| `webview` | 强制桌面原生视图；纯 Web 外壳下会说明原因（"桌面桥不可用"）并退回内嵌框架 | ✅ 实测按预期降级并给出说明 |
+| `iframe` | 直接内嵌框架（纯 Web 版的等价形态） | ✅ 实测 iframe + 镜像 UI 渲染 |
+| `browser` | 不做内嵌，交给系统浏览器打开 | ✅ 实测面板不再内嵌、给出说明 |
+| `rightbar` | **实验性**：先把主区切回对话（右栏是会话作用域的，本面板占着主区时工作面根本没挂载），再尝试把镜像开进官方右栏浏览器标签；失败会退回内嵌框架并说明原因 | ⚠️ 标签能建起来，但**右栏不一定真的打开**；且 `ui-sidebar-browser` 在 Web profile 默认禁用。故不承诺 |
 
 面板上会写明当前用的是哪种容器，方便对着现象排查。
 
@@ -226,6 +226,14 @@ ok  控制台无报错
 ```
 
 跑完把两屏截图写到 `.recon/ui/`（`panel-stopped.png` / `panel-running.png`），可以直接看。
+
+`--open-mode all` 会把五种容器各跑一遍（`rightbar` 是实验性，只验"不崩、有说明"）：
+
+```
+openMode=auto    通过（9 项）    openMode=iframe  通过（9 项）
+openMode=webview 通过（9 项）    openMode=browser 通过（9 项）
+openMode=rightbar 通过（3 项，实验性，不做严格断言）
+```
 
 > 这个脚本当初一跑就抓到一个会让面板**完全不出现**的 bug：slot 的 `inject` 回调里读了
 > `ctx.layout` 却没在插件 `inject` 列表里声明，Cordis 抛 "cannot get property ... without

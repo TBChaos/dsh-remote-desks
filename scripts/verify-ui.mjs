@@ -19,7 +19,8 @@ const argOf = (name, fallback) => {
   return index === -1 ? fallback : (args[index + 1] ?? fallback)
 }
 const port = Number(argOf('port', '19411'))
-const outDir = resolve(root, argOf('out', '.recon/ui'))
+const outRoot = resolve(root, argOf('out', '.recon/ui'))
+const openModeArg = argOf('open-mode', 'auto')
 const keep = args.includes('--keep')
 const skipStart = args.includes('--no-start')
 const pnpmEntry = argOf('pnpm', process.env.DSH_PNPM_ENTRY ?? '')
@@ -42,7 +43,7 @@ function electronBinary() {
   return existsSync(fallback) ? fallback : undefined
 }
 
-function prepareProfile() {
+function prepareProfile(openMode) {
   mkdirSync(profileDir, { recursive: true })
   writeFileSync(
     join(profileDir, 'package.json'),
@@ -61,6 +62,8 @@ function prepareProfile() {
     join(profileDir, 'cordis.patch.yml'),
     [
       `# ${profile}：由 scripts/verify-ui.mjs 生成的临时 profile。`,
+      // ui-sidebar-browser 默认只在 desktop profile 启用；要验 openMode: rightbar 就得打开它。
+      ...(openMode === 'rightbar' ? [`- id: ui-sidebar-browser`, `  disabled: false`] : []),
       `- id: remote-desks`,
       `  config:`,
       `    instances:`,
@@ -70,7 +73,7 @@ function prepareProfile() {
       `        profile: ${instanceProfile}`,
       `        cwd: ${JSON.stringify(root)}`,
       `    autoStart: []`,
-      `    mirror: { host: 127.0.0.1, portRange: [19600, 19610], openMode: auto }`,
+      `    mirror: { host: 127.0.0.1, portRange: [19600, 19610], openMode: ${openMode} }`,
       `    announce: true`,
       '',
     ].join('\n'),
@@ -79,14 +82,23 @@ function prepareProfile() {
   if (existsSync(workspace)) writeFileSync(join(profileDir, 'pnpm-workspace.yaml'), readFileSync(workspace))
 }
 
-async function main() {
-  const electron = electronBinary()
-  if (electron === undefined) {
-    console.log('跳过 UI 验证：没找到 electron 二进制（pnpm install 时允许 electron 的构建脚本即可）')
-    return
-  }
-  console.log(`\n[准备] profile=${profile} port=${String(port)} electron=${electron}`)
-  prepareProfile()
+/** 每种 openMode 期望看到的容器与说明文字。 */
+const EXPECTATIONS = {
+  auto: { stage: 'iframe', note: 'iframe', mirrorFrame: '1' },
+  iframe: { stage: 'iframe', note: 'iframe', mirrorFrame: '1' },
+  // 纯 Web 外壳没有桌面桥，强制 webview 时应当说明原因并退回内嵌框架。
+  webview: { stage: 'iframe', note: '桌面桥不可用', mirrorFrame: '1' },
+  browser: { stage: 'none', note: '系统浏览器', mirrorFrame: '0' },
+  // 右栏载体：实验性。面板会先把主区切回对话（右栏是会话作用域的，面板占着主区时工作面
+  // 根本没挂载），再尝试把镜像开进官方浏览器标签。实测在纯 Web 外壳下该插件默认禁用，
+  // 即便手工启用，标签建起来了但右栏不一定真的打开——所以这里**不做严格断言**，
+  // 只要求"不崩、有说明文字"，其余交给文档明说。
+  rightbar: { stage: 'loose', note: '', mirrorFrame: 'any', createSession: true, preStart: true },
+}
+
+async function runOnce(openMode, outDir, electron) {
+  console.log(`\n=== openMode: ${openMode} ===`)
+  prepareProfile(openMode)
   if (pnpmEntry !== '') {
     const install = spawnSync(nodeBin, [pnpmEntry, 'install', '--dir', profileDir], { encoding: 'utf8' })
     if (install.status !== 0) {
@@ -122,16 +134,52 @@ async function main() {
   try {
     if (readyUrl === undefined) {
       console.log('宿主没起来，无法做 UI 验证')
+      process.exitCode = 1
       return
     }
     console.log(`[宿主] ${readyUrl.replace(/token=.*/, 'token=***')}`)
-    console.log('[浏览器] 打开真实界面并驱动面板…')
 
     // 我们这个 shell 从 DSH 宿主继承了 ELECTRON_RUN_AS_NODE=1；Electron 只看这个变量
     // **是否存在**（空字符串也算），所以必须真删掉，否则它会以 Node 模式启动、根本不开窗口。
-    const electronEnv = { ...process.env, UI_URL: readyUrl, UI_OUT: outDir, UI_INSTANCE: '本机预演实例' }
+    const expectation = EXPECTATIONS[openMode]
+    // 右栏载体会让面板主动让位，DOM 里就看不到实例状态了；所以先经 HTTP 把实例起来，
+    // 再打开面板（面板一显示就会走到右栏分支）。其余模式照常由面板里点「启动」。
+    let preStarted = false
+    if (expectation.preStart === true) {
+      const exchanged = await fetch(`${readyUrl}`, { redirect: 'manual' })
+      const cookie = exchanged.headers.getSetCookie().map((value) => value.split(';')[0]).join('; ')
+      const origin = new URL(readyUrl).origin
+      const started = await fetch(`${origin}/remote-desks/api/instances/ui-local/start`, { method: 'POST', headers: { cookie } })
+      console.log(`[预启动] 实例 start → ${String(started.status)}`)
+      const deadlineAt = Date.now() + 120_000
+      while (Date.now() < deadlineAt) {
+        const state = await fetch(`${origin}/remote-desks/api/instances/ui-local`, { headers: { cookie } })
+        const body = await state.json()
+        if (body.phase === 'running') {
+          preStarted = true
+          console.log(`[预启动] 实例已运行，远端端口 ${String(body.remotePort)}`)
+          break
+        }
+        if (body.phase === 'error') {
+          console.log(`[预启动] 实例出错：${String(body.error)}`)
+          break
+        }
+        await wait(1000)
+      }
+    }
+
+    const electronEnv = {
+      ...process.env,
+      UI_URL: readyUrl,
+      UI_OUT: outDir,
+      UI_INSTANCE: '本机预演实例',
+      UI_EXPECT_STAGE: expectation.stage,
+      UI_EXPECT_NOTE: expectation.note,
+      UI_EXPECT_MIRROR_FRAME: expectation.mirrorFrame,
+    }
     delete electronEnv.ELECTRON_RUN_AS_NODE
-    if (skipStart) electronEnv.UI_SKIP_START = '1'
+    if (skipStart || preStarted) electronEnv.UI_SKIP_START = '1'
+    if (expectation.createSession === true) electronEnv.UI_CREATE_SESSION = '1'
 
     const child = spawn(electron, [join(root, 'scripts', 'ui-verify', 'main.cjs')], {
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -143,19 +191,20 @@ async function main() {
     child.stderr.on('data', (chunk) => process.stderr.write(`[electron] ${chunk}`))
 
     const exitCode = await new Promise((resolvePromise) => child.on('close', resolvePromise))
-    console.log(`\n[浏览器] 退出码 ${String(exitCode)}｜产物在 ${outDir}`)
-
     const resultsPath = join(outDir, 'results.json')
     if (existsSync(resultsPath)) {
       const results = JSON.parse(readFileSync(resultsPath, 'utf8'))
       const failed = (results.steps ?? []).filter((step) => !step.ok)
       if (failed.length > 0) {
-        console.error(`UI 验证失败：${String(failed.length)} 项`)
+        console.error(`openMode=${openMode} 有 ${String(failed.length)} 项不通过`)
         for (const step of failed) console.error(`  - ${step.name} — ${step.detail}`)
         process.exitCode = 1
       } else {
-        console.log(`UI 验证通过：${String(results.steps.length)} 项`)
+        console.log(`openMode=${openMode} 通过（${String(results.steps.length)} 项）｜截图 ${outDir}`)
       }
+    } else {
+      console.error(`openMode=${openMode} 没有产出结果（浏览器退出码 ${String(exitCode)}）`)
+      process.exitCode = 1
     }
   } finally {
     host.kill('SIGTERM')
@@ -170,6 +219,19 @@ async function main() {
         }
       }
     }
+  }
+}
+
+async function main() {
+  const electron = electronBinary()
+  if (electron === undefined) {
+    console.log('跳过 UI 验证：没找到 electron 二进制（pnpm install 时允许 electron 的构建脚本即可）')
+    return
+  }
+  const modes = openModeArg === 'all' ? Object.keys(EXPECTATIONS) : [openModeArg]
+  for (const mode of modes) {
+    if (EXPECTATIONS[mode] === undefined) throw new Error(`未知的 openMode：${mode}`)
+    await runOnce(mode, modes.length === 1 ? outRoot : join(outRoot, mode), electron)
   }
 }
 

@@ -315,15 +315,41 @@ function MirrorStage({
       return
     }
     if (preference === 'rightbar') {
-      if (services.rightbar !== undefined) {
-        services.rightbar.openTab('browser', { params: { url: entryUrl } })
-        services.layout?.openRightbar(false, true)
-        setMode('rightbar')
-        setNote('已按配置（openMode: rightbar）在右栏的浏览器标签中打开')
-      } else {
+      if (services.rightbar === undefined) {
         setMode('iframe')
-        setNote('右栏服务不可用（未启用 ui-sidebar-browser），退回内嵌框架')
+        setNote('右栏服务不可用，退回内嵌框架')
+        return
       }
+      // 右栏是**会话作用域**的，而我们的全页面板恰好占着主区——只要它还显示着，会话工作面
+      // 就没挂载，openTab 会抛 "no session surface is mounted"。
+      // 所以顺序是：先把主区切回对话 → 等会话工作面挂上（重试几次）→ 再把镜像开进右栏；
+      // 始终开不成的话退回本面板的 iframe 载体，并说明原因——不能留一个空白面板。
+      services.layout?.selectPanel('conversation')
+      setMode('rightbar')
+      setNote('正在把镜像开进右栏…')
+
+      let attempts = 0
+      const tryOpen = (): void => {
+        if (disposed) return
+        attempts += 1
+        try {
+          services.rightbar?.openTab('browser', { params: { url: entryUrl } })
+          services.layout?.openRightbar(false, true)
+          setNote('已把镜像开在右栏的浏览器标签里（主区已切回对话）')
+        } catch (error) {
+          if (attempts < 6) {
+            setTimeout(tryOpen, 500)
+            return
+          }
+          // 退回来：重新选中本面板，并改用内嵌框架。
+          services.layout?.selectPanel(PANEL_ID)
+          setMode('iframe')
+          setNote(
+            `右栏浏览器标签不可用，已退回内嵌框架：${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+      }
+      setTimeout(tryOpen, 500)
       return
     }
 

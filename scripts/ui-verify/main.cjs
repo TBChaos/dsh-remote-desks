@@ -12,6 +12,9 @@ const target = process.env.UI_URL
 const outDir = process.env.UI_OUT
 const instanceLabel = process.env.UI_INSTANCE ?? '本机'
 const skipStart = process.env.UI_SKIP_START === '1'
+const expectStage = process.env.UI_EXPECT_STAGE ?? 'iframe'
+const expectNote = process.env.UI_EXPECT_NOTE ?? ''
+const expectMirrorFrame = process.env.UI_EXPECT_MIRROR_FRAME ?? '1'
 
 const results = { steps: [], dom: {} }
 const record = (name, ok, detail = '') => {
@@ -70,6 +73,31 @@ async function main() {
   await waitFor('!!document.querySelector("#root") && document.querySelector("#root").children.length > 0', 30_000, 'shell 挂载')
   await wait(2500)
 
+  // 2b. 右栏是**会话作用域**的：没有挂载会话时 openTab 会抛 "no session surface is mounted"。
+  //     要验 rightbar 载体就得先开一个会话（内容为空也没关系，会话本身只是载体）。
+  if (process.env.UI_CREATE_SESSION === '1') {
+    const created = await js(`
+      (() => {
+        const nodes = Array.from(document.querySelectorAll('button,[role="button"],a'))
+        // 优先 aria-label（侧栏那颗按钮的可读名就是「新建会话」，文本里还带着快捷键）。
+        const target =
+          nodes.find((node) => (node.getAttribute('aria-label') ?? '') === '新建会话') ??
+          nodes.find((node) => (node.textContent ?? '').trim().startsWith('新会话'))
+        if (target === undefined) return false
+        target.click()
+        return true
+      })()
+    `)
+    record('点到了「新会话」', created === true)
+    const mounted = await waitFor(
+      '!!document.querySelector("textarea, [contenteditable=true], .drd-root")',
+      30_000,
+      '会话工作面挂载',
+    )
+    if (!mounted) record('会话工作面挂载', false, '没等到可编辑区')
+    await wait(1500)
+  }
+
   // 3. 我们的侧栏入口（先把候选 dump 出来，找不到时也能看清结构）
   const candidates = await js(`
     Array.from(document.querySelectorAll('button,[role="button"]'))
@@ -103,9 +131,16 @@ async function main() {
     await wait(1200)
   }
 
-  // 4. 面板
-  const panelUp = await waitFor('!!document.querySelector(".drd-root")', 20_000, '面板出现')
-  if (panelUp) {
+  // 4. 面板（rightbar 载体下面板会立刻让位，所以判据放宽成"面板或镜像已出现"）
+  const panelUp =
+    expectStage === 'loose' || expectStage === 'gone'
+      ? await waitFor(
+          '!!document.querySelector(".drd-root") || !!document.querySelector(\'iframe[src*="127.0.0.1:196"]\')',
+          25_000,
+          '面板或镜像出现',
+        )
+      : await waitFor('!!document.querySelector(".drd-root")', 20_000, '面板出现')
+  if (panelUp && expectStage !== 'gone' && expectStage !== 'loose') {
     const panelText = await js('document.querySelector(".drd-root").innerText')
     results.dom.panelText = panelText.slice(0, 800)
     record('面板渲染出内容', panelText.includes('远端工作台'), panelText.split('\n').slice(0, 3).join(' / '))
@@ -113,8 +148,8 @@ async function main() {
     fs.writeFileSync(path.join(outDir, 'panel-stopped.png'), (await wc.capturePage()).toPNG())
   }
 
-  // 5. 点启动 → 等运行中
-  if (panelUp && !skipStart) {
+  // 5. 点启动 → 等运行中（rightbar 模式已由驱动脚本经 HTTP 预启动，面板也会让位）
+  if (panelUp && expectStage !== 'gone' && expectStage !== 'loose' && !skipStart) {
     const clicked = await js(`
       (() => {
         const buttons = Array.from(document.querySelectorAll('.drd-toolbar button'))
@@ -132,20 +167,60 @@ async function main() {
     )
     if (running) {
       record('面板显示运行中', true, (await js('document.querySelector(".drd-toolbar").innerText')).replace(/\n/g, ' / '))
-      // 等镜像容器把远端 UI 拉起来
+      // 等镜像容器就位：内嵌载体看 .drd-stage，右栏载体则看"面板已让位"。
       const staged = await waitFor(
-        '!!document.querySelector(".drd-stage iframe, .drd-stage webview")',
+        expectStage === 'gone'
+          ? 'document.querySelector(".drd-root") === null'
+          : '!!document.querySelector(".drd-stage iframe, .drd-stage webview, .drd-stage .drd-placeholder")',
         30_000,
-        '镜像容器出现',
+        expectStage === 'gone' ? '面板让位' : '镜像容器出现',
       )
       if (staged) {
         const carrier = await js(
           'document.querySelector(".drd-stage webview") !== null ? "webview" : (document.querySelector(".drd-stage iframe") !== null ? "iframe" : "none")',
         )
-        record('镜像容器类型', true, carrier)
-        await wait(8000)
-        const note = await js('(document.querySelector(".drd-root .drd-meta") ?? {}).innerText ?? ""')
-        record('容器状态说明', true, String(note).slice(0, 120))
+        if (expectStage === 'loose') {
+          // 实验性载体：只记录观察到的状态，不判成败。
+          console.log(`  ·（loose）观察到的状态：${carrier}｜面板${(await js('document.querySelector(".drd-root") === null')) ? '已让位' : '仍在'}`)
+        } else {
+          const actual =
+            expectStage === 'gone'
+              ? (await js('document.querySelector(".drd-root") === null'))
+                ? 'gone'
+                : 'still-mounted'
+              : carrier
+          record(`容器类型符合预期（${expectStage}）`, actual === expectStage, `实际 ${String(actual)}`)
+        }
+
+        await wait(2500)
+        if (expectNote !== '') {
+          const notes = await js(
+            'Array.from(document.querySelectorAll(".drd-root .drd-meta, .drd-stage .drd-placeholder")).map((n) => n.innerText).join(" | ")',
+          )
+          record(
+            `容器说明含「${expectNote}」`,
+            String(notes).includes(expectNote),
+            String(notes).replace(/\n/g, ' ').slice(0, 160),
+          )
+        }
+
+        // 指向镜像端口的 iframe 是否存在（内嵌载体在面板里，右栏载体在官方标签里）
+        await wait(4000)
+        const mirrorFrames = await js(`
+          Array.from(document.querySelectorAll('iframe'))
+            .map((node) => node.getAttribute('src') ?? '')
+            .filter((src) => /^http:\\/\\/127\\.0\\.0\\.1:196\\d\\d\\//.test(src))
+        `)
+        const hasMirrorFrame = Array.isArray(mirrorFrames) && mirrorFrames.length > 0
+        if (expectMirrorFrame === 'any') {
+          console.log(`  ·（loose）文档里指向镜像端口的 iframe：${String((mirrorFrames ?? []).length)} 个`)
+        } else {
+          record(
+            `镜像 iframe 存在性符合预期（期望 ${expectMirrorFrame}）`,
+            hasMirrorFrame === (expectMirrorFrame === '1'),
+            `实际 ${String(hasMirrorFrame)}（${String((mirrorFrames ?? []).length)} 个）`,
+          )
+        }
       }
       fs.writeFileSync(path.join(outDir, 'panel-running.png'), (await wc.capturePage()).toPNG())
     }
@@ -153,6 +228,19 @@ async function main() {
 
   fs.writeFileSync(path.join(outDir, 'results.json'), JSON.stringify({ ...results, consoleErrors }, null, 2))
   record('控制台无报错', consoleErrors.length === 0, consoleErrors.slice(0, 2).join(' | '))
+  if (expectStage === 'gone') {
+    // 右栏载体的最终判据：面板已让位，且文档里出现了指向镜像端口的 iframe。
+    await wait(6000)
+    const gone = await js('document.querySelector(".drd-root") === null')
+    const frames = await js(`
+      Array.from(document.querySelectorAll('iframe'))
+        .map((node) => node.getAttribute('src') ?? '')
+        .filter((src) => /^http:\\/\\/127\\.0\\.0\\.1:196\\d\\d\\//.test(src))
+    `)
+    record('面板已让位给右栏', gone === true)
+    record('右栏里出现镜像 iframe', Array.isArray(frames) && frames.length > 0, `${String((frames ?? []).length)} 个`)
+    fs.writeFileSync(path.join(outDir, 'panel-rightbar.png'), (await wc.capturePage()).toPNG())
+  }
   win.destroy()
   app.exit(0)
 }
