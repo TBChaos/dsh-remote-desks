@@ -101,7 +101,9 @@ const EXPECTATIONS = {
   'webview-client': {
     stage: 'webview',
     note: '桌面原生视图',
-    mirrorFrame: 'guest',
+    // guest 的内容在这一档是观察项（模拟壳子没有真桌面应用的会话/分区准备），
+    // 而且验兜底出口时会把载体切成 iframe，所以这里不做 iframe 存在性判定。
+    mirrorFrame: 'any',
     injectBridge: true,
     configMode: 'webview',
   },

@@ -310,6 +310,12 @@ function MirrorStage({
   const hostRef = useRef<HTMLDivElement | null>(null)
   const [mode, setMode] = useState<CarrierMode>('pending')
   const [note, setNote] = useState<string>('')
+  /** webview 挂上了、也导航了，但 guest 里看起来是空的——给用户一个手动换载体的出口。 */
+  const [stuck, setStuck] = useState(false)
+  const toIframeRef = useRef<(() => void) | undefined>(undefined)
+  const switchToIframe = (): void => {
+    toIframeRef.current?.()
+  }
 
   useEffect(() => {
     const host = hostRef.current
@@ -317,6 +323,7 @@ function MirrorStage({
     let disposed = false
     let disposeView: (() => void) | undefined
     let watchdog: ReturnType<typeof setTimeout> | undefined
+    let probeTimer: ReturnType<typeof setTimeout> | undefined
 
     const bridge = (window as unknown as { dshDesktop?: DesktopBridge }).dshDesktop
     const acquire = bridge?.browser?.acquire
@@ -391,6 +398,8 @@ function MirrorStage({
         // partition 要在 src 之前设置——它必须在首次导航前就位，顺序反了会踩 Electron 的警告路径。
         const view = document.createElement('webview') as HTMLElement & {
           setAttribute(name: string, value: string): void
+          /** `<webview>` 特有：在 guest 里执行脚本（跨源也能用，因为宿主掌握它的 webContents）。 */
+          executeJavaScript(code: string): Promise<unknown>
         }
         view.setAttribute('partition', partition)
         view.setAttribute('src', `about:blank#${lease}`)
@@ -408,6 +417,9 @@ function MirrorStage({
           setMode('iframe')
           setNote(reason)
         }
+        toIframeRef.current = () => {
+          fallback('已按你的选择改用内嵌框架。')
+        }
         watchdog = setTimeout(() => {
           fallback('桌面原生视图 8 秒内没有就绪（可能是主进程拒绝了挂载：租约或 partition 不匹配）。已改用内嵌框架。')
         }, 8_000)
@@ -418,6 +430,31 @@ function MirrorStage({
           }
           if (!disposed) view.setAttribute('src', entryUrl)
         })
+        // 加载结束再看一眼 guest 里到底有没有东西：挂上了却渲染不出来，是这个载体唯一
+        // 测不到的那半边最容易出的岔子。探测只用来提示，不自动拆视图（可能只是慢）。
+        // did-finish-load 未必会来（被拒或一直挂着都会有），所以再加一次定时兜底。
+        let probed = false
+        const probeGuest = (): void => {
+          if (probed || disposed) return
+          probed = true
+          void (async () => {
+            try {
+              const probe = await Promise.race([
+                view.executeJavaScript('document.body ? document.body.childElementCount : -1'),
+                new Promise((done) => setTimeout(() => done(-2), 5_000)),
+              ])
+              if (disposed || typeof probe !== 'number' || probe > 0) return
+              setStuck(true)
+              setNote(
+                '桌面原生视图已加载，但里面看起来是空的（远端界面可能没渲染出来）。可以点右侧按钮改用内嵌框架。',
+              )
+            } catch {
+              /* 探测本身失败就当没发生，不要因此打断镜像 */
+            }
+          })()
+        }
+        view.addEventListener('did-finish-load', probeGuest)
+        probeTimer = setTimeout(probeGuest, 6_000)
         view.addEventListener('did-fail-load', (event: Event) => {
           const detail = event as unknown as { errorCode?: number; errorDescription?: string; isMainFrame?: boolean }
           if (detail.isMainFrame === false) return
@@ -454,6 +491,8 @@ function MirrorStage({
     return () => {
       disposed = true
       if (watchdog !== undefined) clearTimeout(watchdog)
+      if (probeTimer !== undefined) clearTimeout(probeTimer)
+      toIframeRef.current = undefined
       disposeView?.()
     }
   }, [entryUrl, preference, services])
@@ -484,8 +523,15 @@ function MirrorStage({
       </div>
       {mode === 'pending' ? <div className="drd-placeholder">正在打开镜像…</div> : null}
       {mode !== 'pending' && note !== '' ? (
-        <div className="drd-meta" style={{ padding: '6px 16px' }}>
-          {note}
+        <div className="drd-meta" style={{ padding: '6px 16px', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span>{note}</span>
+          {mode === 'webview' && stuck ? (
+            // 兜底出口：桌面那条路我测不到主进程那半边，万一挂上了却渲染不出来，
+            // 用户得有一键换载体的办法，而不是去改配置重启。
+            <button type="button" className="drd-btn" onClick={switchToIframe}>
+              改用内嵌框架
+            </button>
+          ) : null}
         </div>
       ) : null}
     </div>

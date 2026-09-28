@@ -48,8 +48,9 @@ async function main() {
     // Electron 自己会就 CSP 发一条安全警告，那不是我们代码的问题。
     if (text.includes('Electron Security Warning')) return
     // 镜像端点用 302 发票据 cookie，Electron 会把被顶掉的导航记成 ERR_ABORTED——
-    // 这是正常流程的噪声，客户端那边也已经显式忽略 -3。
-    if (text.includes('ERR_ABORTED')) return
+    // 这是正常流程的噪声，客户端那边也已经显式忽略 -3。GUEST_VIEW_MANAGER_CALL 则是
+    // 模拟壳子里 guest 自己的加载报错（webview-client 那一档已把 guest 内容列为观察项）。
+    if (text.includes('ERR_ABORTED') || text.includes('GUEST_VIEW_MANAGER_CALL')) return
     if (level >= 2) consoleErrors.push(text.slice(0, 300))
   })
   wc.on('render-process-gone', (_event, details) => record('渲染进程存活', false, JSON.stringify(details)))
@@ -238,6 +239,13 @@ async function main() {
           console.log(`  ·（loose）观察到的状态：${carrier}｜面板${(await js('document.querySelector(".drd-root") === null')) ? '已让位' : '仍在'}`)
         } else if (expectStage === 'webview') {
           record('容器类型是 webview', carrier === 'webview', `实际 ${String(carrier)}`)
+          // 先把"还在 webview 状态"时的说明文字断言掉，再往下点兜底按钮（点了就变 iframe 了）。
+          const noteNow = await js('Array.from(document.querySelectorAll(".drd-meta")).map((n) => n.innerText).join(" | ")')
+          record(
+            `容器说明含「${expectNote}」`,
+            String(noteNow).includes(expectNote),
+            String(noteNow).replace(/\n/g, ' ').slice(0, 140),
+          )
           // 关键证据：guest 真的挂上了、导航到了镜像地址，而且它自己那份 DOM 里是远端 UI。
           await wait(8_000)
           if (guestRef === undefined) {
@@ -261,6 +269,27 @@ async function main() {
               `  ·（观察）guest 里取到 ${String(guestDom).length} 字符` +
                 `${String(guestDom).includes('__DSH_BOOT__') ? '，含远端 UI 的 __DSH_BOOT__' : '，没有远端 UI 痕迹'}`,
             )
+            // 顺手验一下"挂上了却是空的"这条兜底：提示要出现，一键换载体要能用。
+            await wait(4_000)
+            const notes = await js('Array.from(document.querySelectorAll(".drd-meta")).map((n) => n.innerText).join(" | ")')
+            record('空 guest 被识别并给出提示', String(notes).includes('空的'), String(notes).replace(/\n/g, ' ').slice(0, 120))
+            const switched = await js(`
+              (() => {
+                const button = Array.from(document.querySelectorAll('.drd-stage button'))
+                  .find((node) => (node.textContent ?? '').trim() === '改用内嵌框架')
+                if (button === undefined) return false
+                button.click()
+                return true
+              })()
+            `)
+            record('点得到「改用内嵌框架」', switched === true)
+            if (switched) {
+              await wait(3_000)
+              const after = await js(
+                'document.querySelector(".drd-stage iframe") !== null ? "iframe" : (document.querySelector(".drd-stage webview") !== null ? "webview" : "none")',
+              )
+              record('已退到内嵌框架', after === 'iframe', String(after))
+            }
           }
         } else {
           const actual =
@@ -273,7 +302,8 @@ async function main() {
         }
 
         await wait(2500)
-        if (expectNote !== '') {
+        // webview 档在分支里已经断言过说明文字了（那时还没点兜底按钮，状态才是对的）。
+        if (expectNote !== '' && expectStage !== 'webview') {
           const notes = await js(
             'Array.from(document.querySelectorAll(".drd-root .drd-meta, .drd-stage .drd-placeholder")).map((n) => n.innerText).join(" | ")',
           )
