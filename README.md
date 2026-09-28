@@ -345,8 +345,8 @@ ok  控制台无报错
 `--open-mode all` 会把五种容器各跑一遍（`rightbar` 是实验性，只验"不崩、有说明"）：
 
 ```
-openMode=auto    通过（9 项）    openMode=iframe  通过（9 项）
-openMode=webview 通过（9 项）    openMode=browser 通过（9 项）
+openMode=auto    通过（11 项）    openMode=iframe  通过（9 项）
+openMode=webview 通过（9 项）     openMode=browser 通过（9 项）
 openMode=rightbar 通过（3 项，实验性，不做严格断言）
 ```
 
@@ -387,6 +387,19 @@ index 的 `window.__DSH_BOOT__` 里出现本插件的行 → 取到 `__ModuleLoa
 它还带两个**故意坏掉**的实例，专门盯失败路径：入口文件不存在的本机实例（进程退出 → `error`
 → 有可读原因 → 不暴露端点 → **仍可重试**），以及永不打印就绪行的 WSL 实例（按
 `readyTimeoutMs` 超时 → `error` → "等待就绪行超时"）。
+
+**更新与回滚则在三条通道上各走一遍**（本机 / WSL / SSH），命令统一用无害的
+`echo update-probe {version}`——验证脚本不该动你机器上的真实安装：
+
+```
+ok  WSL 通道探测到版本 — 0.1.5-rc.3（来源 dsh -V）
+ok  SSH 通道探测到版本 — 0.1.5-rc.3（来源 dsh -V）
+ok  WSL 通道更新成功 — 更新命令以 0 退出（版本 0.1.5-rc.3 → 0.1.5-rc.3）
+ok  SSH 通道回滚成功 — echo update-probe 0.1.5-rc.3
+```
+
+这三条各自压着不同的代码路径：本机读 `package.json`；WSL 走 `wsl.exe` + bash（要带 nvm 前置，
+否则非交互 shell 里找不到 node）；SSH 临时开一条连接、用完即收（日志里能看到"目标 SSH 连接已关闭"）。
 
 **第三道 · 装进桌面版**：`dsh-remote-desks` 已装入 desktop profile，`dsh.bundle.patch` 会把
 `remote-desks` 行插进 Loader 树。桌面版是**启动型 profile**，加载新 bundle 行需要**重启一次

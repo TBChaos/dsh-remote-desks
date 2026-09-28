@@ -179,7 +179,17 @@ async function main() {
       '实例进入运行中',
     )
     if (running) {
-      record('面板显示运行中', true, (await js('document.querySelector(".drd-toolbar").innerText')).replace(/\n/g, ' / '))
+      const runningText = (await js('document.querySelector(".drd-toolbar").innerText')).replace(/\n/g, ' / ')
+      record('面板显示运行中', true, runningText)
+      record('工具栏含「更新」', runningText.includes('更新'))
+      const updateDisabled = await js(`
+        (() => {
+          const button = Array.from(document.querySelectorAll('.drd-toolbar button'))
+            .find((node) => (node.textContent ?? '').trim() === '更新')
+          return button === undefined ? 'missing' : String(button.disabled)
+        })()
+      `)
+      record('运行中「更新」被禁用', updateDisabled === 'true', String(updateDisabled))
       // 等镜像容器就位：内嵌载体看 .drd-stage，右栏载体则看"面板已让位"。
       const staged = await waitFor(
         expectStage === 'gone'

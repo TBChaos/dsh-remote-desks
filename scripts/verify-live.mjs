@@ -101,6 +101,15 @@ function prepareProfile() {
       `        launchCommand: sleep 60`,
       `        readyTimeoutMs: 4000`,
     )
+    // WSL 通道上的更新路径（版本探测走 wsl.exe + nvm 前置；命令仍用无害的 echo）。
+    instances.push(
+      `      - id: upd-wsl`,
+      `        kind: wsl`,
+      `        label: WSL 可更新`,
+      `        distro: ${wslDistro}`,
+      `        cwd: /home/zmh`,
+      `        updateCommand: echo update-probe {version}`,
+    )
   }
   if (sshMode) {
     instances.push(
@@ -110,6 +119,20 @@ function prepareProfile() {
       `        port: ${String(sshPort)}`,
       `        username: dsh-test`,
       `        cwd: /home/zmh`,
+      `        auth:`,
+      `          method: password`,
+      `          passwordCredential: ${sshCredentialRef}`,
+    )
+    // SSH 通道上的更新路径（版本探测要临时开一条连接，用完即收）。
+    instances.push(
+      `      - id: upd-ssh`,
+      `        kind: ssh`,
+      `        label: SSH 可更新`,
+      `        host: 127.0.0.1`,
+      `        port: ${String(sshPort)}`,
+      `        username: dsh-test`,
+      `        cwd: /home/zmh`,
+      `        updateCommand: echo update-probe {version}`,
       `        auth:`,
       `          method: password`,
       `          passwordCredential: ${sshCredentialRef}`,
@@ -567,6 +590,37 @@ async function main() {
       String(JSON.parse(immutable.text).message ?? '').slice(0, 70),
     )
     check('未知实例取版本 → 404', (await get(`${base}/remote-desks/api/instances/nope/version`, { cookie })).status === 404)
+
+    /* ── 同样的更新机制，换 WSL / SSH 通道再走一遍 ── */
+    if (wslDistro !== '' || sshMode) {
+      console.log('\n[更新] 换通道：WSL / SSH')
+    }
+    for (const [id, label] of [
+      ...(wslDistro === '' ? [] : [['m1-wsl', 'WSL']]),
+      ...(sshMode ? [['m2-ssh', 'SSH']] : []),
+    ]) {
+      const probe = await get(`${base}/remote-desks/api/instances/${id}/version`, { cookie })
+      const body = JSON.parse(probe.text)
+      check(`${label} 通道探测到版本`, probe.status === 200 && body.ok === true, `${String(body.version)}（来源 ${String(body.source)}）`)
+    }
+    for (const [id, label] of [
+      ...(wslDistro === '' ? [] : [['upd-wsl', 'WSL']]),
+      ...(sshMode ? [['upd-ssh', 'SSH']] : []),
+    ]) {
+      const updated2 = await post(`${base}/remote-desks/api/instances/${id}/update`, { cookie })
+      const body2 = JSON.parse(updated2.text)
+      check(`${label} 通道更新成功`, updated2.status === 200 && body2.ok === true, `${String(body2.record?.detail)}`)
+      check(`${label} 更新命令按 latest 渲染`, body2.command === 'echo update-probe latest', String(body2.command))
+      const snap = JSON.parse((await get(`${base}/remote-desks/api/instances/${id}`, { cookie })).text)
+      check(
+        `${label} 通道日志里有命令输出`,
+        (snap.logs?.lines ?? []).some((line) => line.includes('update-probe latest')),
+        (snap.logs?.lines ?? []).slice(-2).join(' | '),
+      )
+      const back2 = await post(`${base}/remote-desks/api/instances/${id}/rollback`, { cookie })
+      const backBody = JSON.parse(back2.text)
+      check(`${label} 通道回滚成功`, back2.status === 200 && backBody.ok === true, String(backBody.command))
+    }
   } finally {
     if (failures.length > 0) {
       const tail = stderr.trim().split('\n').slice(-18).join('\n  ')
@@ -583,7 +637,7 @@ async function main() {
       if (sshServer.exitCode === null) sshServer.kill('SIGKILL')
     }
     if (!keepProfile) {
-      for (const dir of [profileDir, join(dshHome, 'profiles', localInstanceProfile), join(dshHome, 'profiles', wslInstanceProfile), join(dshHome, 'profiles', 'mirror-bad-entry'), join(dshHome, 'profiles', 'mirror-upd-local'), join(dshHome, 'profiles', 'mirror-upd-immutable')]) {
+      for (const dir of [profileDir, join(dshHome, 'profiles', localInstanceProfile), join(dshHome, 'profiles', wslInstanceProfile), join(dshHome, 'profiles', 'mirror-bad-entry'), join(dshHome, 'profiles', 'mirror-upd-local'), join(dshHome, 'profiles', 'mirror-upd-immutable'), join(dshHome, 'profiles', 'mirror-upd-wsl'), join(dshHome, 'profiles', 'mirror-upd-ssh')]) {
         try {
           rmSync(dir, { recursive: true, force: true })
         } catch {
