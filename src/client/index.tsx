@@ -792,8 +792,14 @@ function PanelIcon(props: { size?: number }): ReactNode {
   )
 }
 
-/** 需要的客户端服务：插槽注册表。 */
-export const inject = ['slots']
+/**
+ * 需要的客户端服务。
+ *
+ * `layout` 必须在这里声明：slot 的 inject 回调里直接读 `ctx.layout`，而 Cordis 对未声明
+ * 的服务会抛 "cannot get property ... without inject"——实测这个异常会让面板根本注册不上
+ * （浏览器验证抓到的，冒烟/SSR/HTTP 都看不到）。`sidebarRight` 是可选能力，走 `ctx.get()`。
+ */
+export const inject = ['slots', 'layout']
 
 /**
  * 客户端入口：注册面板入口、主面板与设置页。
@@ -812,11 +818,12 @@ export function apply(ctx: ClientContext): void {
 
   ctx.slots.inject('main', () =>
     // 把宿主服务随 slot 注入，面板因此能按 openMode 使用官方右栏浏览器标签。
+    // sidebarRight 是可选能力（要装了 ui-sidebar-browser 才有），所以用 ctx.get 探测。
     ctx.slots.register(
       {
         name: 'main',
         key: PANEL_ID,
-        inject: () => ({ layout: ctx.layout, rightbar: ctx.sidebarRight }),
+        inject: () => ({ layout: ctx.layout, rightbar: ctx.get?.('sidebarRight') as RightbarService | undefined }),
       },
       Panel as never,
     ),

@@ -6,12 +6,13 @@
 # list with `pnpm install` whenever the DSH runtime version changes.
 #
 # Build scripts: `esbuild` must run its install script so the platform binary is
-# linked (the client half is bundled with it). `ssh2`/`cpu-features` are allowed
-# for the M2 SSH launcher; ssh2 degrades gracefully without the native
-# accelerator. Every other build script stays blocked: the DSH peers are supplied
-# by the runtime, not built here.
+# linked (the client half is bundled with it); `electron` must run its install
+# script to download the Chromium used by the UI verification script; `ssh2` /
+# `cpu-features` are allowed for the M2 SSH launcher. Every other build script
+# stays blocked: the DSH peers are supplied by the runtime, not built here.
 allowBuilds:
   esbuild: true
+  electron: true
   ssh2: true
   cpu-features: true
   '@deepseek-ai/dsh-subprocess-local': false

@@ -6,10 +6,11 @@
 镜像出来的界面就是 DSH 自己的前端（随远端版本走），桌面窗口的外壳、主题、侧栏与快捷键
 全部复用当前应用，不另造一套 UI。
 
-> **状态：M0 / M1 / M2 / M3 代码完成，宿主侧全部已验证。** 本机、WSL、SSH 三种实例都能
-> 并发启动、镜像、停止；面板、设置页、日志抽屉、容器降级链都已接好。
-> **待你验收的是界面**：面板与 webview/iframe 容器的渲染需要有头环境，自动化验证覆盖不到
-> （见 [已知边界](#已知边界未自动验证的部分)）。
+> **状态：M0 / M1 / M2 / M3 完成。** 本机、WSL、SSH 三种实例都能并发启动、镜像、停止；
+> 面板、设置页、日志抽屉、预检、容器降级链都已接好，并且**在真实浏览器里驱动界面验证过**
+> （见下方截图与 `pnpm verify:ui`）。剩下真正需要人眼的只有桌面版 Electron `<webview>` 那条路。
+
+![面板里镜像另一个 DSH 实例](docs/panel-running.png)
 
 ## 它解决什么
 
@@ -210,6 +211,25 @@ node scripts/verify-electron-local.mjs [--app "<DeepSeek Harness.exe>"]
 用 `app.asar` 里的 DSH 入口 + Electron Node 模式构造启动计划（校验 argv 与 env），真的把进程
 起起来，等就绪行、换会话 cookie、起镜像端点、经代理取回远端 UI。这条路径与你第一次点「启动」
 时执行的完全一致。
+
+**第三道 · `pnpm verify:ui`（真实浏览器驱动界面）** 起宿主后，用 Electron（与桌面应用同一套
+Chromium）打开真实界面，走正常入口（token → cookie），然后**真的去点**：
+
+```
+ok  界面已加载 / 侧栏里找到本插件入口 {"label":"远端工作台", …}
+ok  面板渲染出内容 — 远端工作台 / 1 个实例 / 刷新
+ok  面板里看得到实例 — 本机预演实例
+ok  点到了「启动」
+ok  面板显示运行中 — … 运行中，远端端口 64660 …
+ok  镜像容器类型 — iframe
+ok  控制台无报错
+```
+
+跑完把两屏截图写到 `.recon/ui/`（`panel-stopped.png` / `panel-running.png`），可以直接看。
+
+> 这个脚本当初一跑就抓到一个会让面板**完全不出现**的 bug：slot 的 `inject` 回调里读了
+> `ctx.layout` 却没在插件 `inject` 列表里声明，Cordis 抛 "cannot get property ... without
+> inject"，注册整体失败。冒烟、SSR、活体 HTTP 全都测不出来——只有真壳子会暴露。
 
 ### 三道验证
 
