@@ -1,0 +1,26 @@
+# dsh-remote-desks —— bundle patch 层
+#
+# 这个文件由 package.json 的 `dsh.bundle.patch` 指向：安装本包时，下面这一行会被插进 profile
+# 的 Loader 树（profile 自己的 cordis.patch.yml 与 --patch 覆盖层仍然后应用）。
+#
+# 该行默认**启用**，因为客户端面板本身就是本插件的可见入口；但启用不等于会跑东西——
+# 实例全部来自 config.instances，空配置下它只注册一个控制接口（/remote-desks/api/state）
+# 与一个面板，不启动任何进程、不修改任何配置。
+
+- insert:
+    - id: remote-desks
+      name: dsh-remote-desks
+      config:
+        # 实例列表。kind 取 local / wsl / ssh；M1 起生效。
+        instances: []
+        # 桌面应用启动时自动拉起的实例 id。
+        autoStart: []
+        mirror:
+          # 镜像端点只监听回环地址。
+          host: 127.0.0.1
+          # [] 或 [0, 0] 表示端口交给操作系统分配。
+          portRange: [0, 0]
+          # auto = 按能力探测选择 webview / rightbar / iframe / browser。
+          openMode: auto
+        # 把就绪信息写进 host 日志。
+        announce: true
