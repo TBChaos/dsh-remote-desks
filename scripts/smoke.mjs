@@ -481,6 +481,80 @@ const connection = new sshManager.SshConnection({
 })
 check('SSH 描述含跳板链', connection.describe().includes('jump.example') && connection.describe().includes('h.example'), connection.describe())
 
+/* ── 7. 面板渲染（SSR：不跑 effect，但会把组件树真的执行一遍） ── */
+
+console.log('\n[7] 面板渲染（react-dom/server）')
+const React = (await import('react')).default
+const { renderToStaticMarkup } = await import('react-dom/server')
+// 渲染路径必须用真的 jsx 运行时：先前那个桩返回 null，整棵树会渲染成空字符串。
+const realJsxRuntime = await import('react/jsx-runtime')
+
+/** 再加载一次 bundle，这次用**真的** react / react-dom 当 require 后端。 */
+const realLoad = { factory: undefined }
+const realSandbox = {
+  window: {
+    __ModuleLoader__: {
+      load(definition) {
+        realLoad.factory = definition.factory
+      },
+    },
+  },
+  console,
+}
+vm.runInNewContext(source, realSandbox, { filename: 'lib/client.js' })
+const realRequire = (request) => {
+  if (request === 'react') return React
+  if (request === 'react/jsx-runtime') return realJsxRuntime
+  throw new Error(`面板渲染只允许基线模块，收到：${request}`)
+}
+const realExports = realLoad.factory(realRequire)
+
+const rendered = []
+const renderCtx = {
+  slots: {
+    inject: (_key, callback) => {
+      callback()
+      return () => {}
+    },
+    register: (options, component) => {
+      rendered.push({ options, component })
+      return () => {}
+    },
+  },
+  layout: { selectPanel: () => {}, openRightbar: () => {} },
+  sidebarRight: { openTab: () => {} },
+}
+realExports.apply(renderCtx)
+
+const byName = (name) => rendered.find((entry) => entry.options.name === name)?.component
+const panel = byName('main')
+const icon = byName('sidebar.panellist')
+const settings = byName('settings.section')
+check('渲染前拿到三个组件', panel !== undefined && icon !== undefined && settings !== undefined)
+
+try {
+  const panelHtml = renderToStaticMarkup(React.createElement(panel, { layout: renderCtx.layout, rightbar: renderCtx.sidebarRight }))
+  check('面板能渲染出 HTML', panelHtml.length > 100, `${String(panelHtml.length)} 字符`)
+  check('面板标题是中文名', panelHtml.includes('远端工作台'))
+  check('空配置时给出可操作提示', panelHtml.includes('cordis.patch.yml') || panelHtml.includes('还没有配置实例'))
+} catch (error) {
+  check('面板能渲染出 HTML', false, error instanceof Error ? error.message : String(error))
+}
+
+try {
+  const iconHtml = renderToStaticMarkup(React.createElement(icon, { size: 20, active: false }))
+  check('侧栏图标渲染为 svg', iconHtml.startsWith('<svg') && iconHtml.includes('width="20"'), iconHtml.slice(0, 40))
+} catch (error) {
+  check('侧栏图标渲染为 svg', false, error instanceof Error ? error.message : String(error))
+}
+
+try {
+  const settingsHtml = renderToStaticMarkup(React.createElement(settings, {}))
+  check('设置页能渲染出 HTML', settingsHtml.includes('设置') && settingsHtml.includes('配置示例'), `${String(settingsHtml.length)} 字符`)
+} catch (error) {
+  check('设置页能渲染出 HTML', false, error instanceof Error ? error.message : String(error))
+}
+
 /* ── 汇总 ── */
 
 console.log('')

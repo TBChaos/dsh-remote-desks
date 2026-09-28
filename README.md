@@ -193,14 +193,25 @@ node scripts/verify-live.mjs --ssh --pnpm <pnpm.mjs> --node <node.exe> # 验证�
 pnpm install
 pnpm build        # tsc -> lib/，再把客户端打成一枚 __ModuleLoader__ bundle
 pnpm typecheck    # host 与 client 两套 tsconfig
-pnpm smoke        # 载入真实产物跑行为断言（53 项）
+pnpm smoke        # 载入真实产物跑行为断言（121 项）
 pnpm verify       # build + smoke
 pnpm verify:live  # 起一个真实 DSH 实例做端到端验证（见下）
 ```
 
+另外一个专门的预演脚本——**用桌面版自带运行时把"点启动"整条路径走一遍**：
+
+```bash
+node scripts/verify-electron-local.mjs [--app "<DeepSeek Harness.exe>"]
+```
+
+它不宿主、不起 profile 树，而是直接调本插件的 `planFor` / `exchangeSession` / `MirrorEndpoint`：
+用 `app.asar` 里的 DSH 入口 + Electron Node 模式构造启动计划（校验 argv 与 env），真的把进程
+起起来，等就绪行、换会话 cookie、起镜像端点、经代理取回远端 UI。这条路径与你第一次点「启动」
+时执行的完全一致。
+
 ### 三道验证
 
-**第一道 · `pnpm smoke`（112 项）** 跑真实产物，不复述实现：
+**第一道 · `pnpm smoke`（121 项）** 跑真实产物，不复述实现：
 
 1. 导入 `lib/index.js`，检查插件契约（`name` / `inject` / `Config` / `apply`），
    用真实 `Config` 校验空配置补全、默认值、非法 `kind` 与缺 `id` 的拒绝；
@@ -263,9 +274,9 @@ cordis.patch.yml        bundle patch（安装时并入 profile）
 
 自动化能证明的都证明了；剩下这几条要么需要人眼，要么需要真实环境，写在这里免得误以为都覆盖了：
 
-1. **面板与镜像容器的渲染**：webview / iframe 的实际显示需要有头浏览器或桌面窗口，验证脚本
-   只能证明"客户端 bundle 被正确服务、`__ModuleLoader__` 形态正确、slot 注册齐全"。
-   需要你重启桌面应用看一次。
+1. **面板与镜像容器的交互渲染**：`pnpm smoke` 用 `react-dom/server` 把面板、侧栏图标、设置页
+   真的渲染了一遍（渲染期崩了就是白屏，这一类已经覆盖），但 SSR 不跑 effect——**带数据的状态、
+   webview/iframe 的实际显示**仍需要有头环境。需要你重启桌面应用看一次。
 2. **真实 sshd 的互操作**：SSH 腿用仓库自带的测试对端（ssh2 Server，真实 SSH 协议）验证，
    覆盖了连接、密码认证、exec、`direct-tcpip`、隧道换 cookie、镜像往返。**没覆盖**的是各家
    sshd 的特有行为：`keyboard-interactive`、`ProxyJump` 在服务端的配置差异、以及主机密钥
