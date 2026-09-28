@@ -28,10 +28,26 @@ interface SlotsService {
   register(options: SlotRegisterOptions, component: (props: never) => ReactNode): () => void
 }
 
+interface RightbarService {
+  openTab(kind: string, options?: { params?: Record<string, unknown> }): unknown
+}
+
+interface LayoutService {
+  selectPanel(panelId: string | null): void
+  openRightbar(track: boolean, fullscreen: boolean): void
+}
+
 interface ClientContext {
   slots: SlotsService
   get?(key: string): unknown
-  layout?: { selectPanel(panelId: string | null): void }
+  layout?: LayoutService
+  sidebarRight?: RightbarService
+}
+
+/** 面板拿到的宿主服务（由 slot 的 inject 注入）。 */
+interface PanelServices {
+  layout?: LayoutService
+  rightbar?: RightbarService
 }
 
 interface HostReport {
@@ -254,7 +270,10 @@ function useInstanceLogs(id: string | undefined, enabled: boolean): { lines: str
 
 /* ── 镜像容器：桌面走官方 webview lease，其余降级 ── */
 
-type CarrierMode = 'pending' | 'webview' | 'iframe' | 'failed'
+type CarrierMode = 'pending' | 'webview' | 'iframe' | 'failed' | 'external' | 'rightbar'
+
+/** 镜像容器的偏好，来自配置 `mirror.openMode`。 */
+type CarrierPreference = 'auto' | 'webview' | 'iframe' | 'browser' | 'rightbar'
 
 interface DesktopBridge {
   browser?: {
@@ -263,7 +282,17 @@ interface DesktopBridge {
   }
 }
 
-function MirrorStage({ entryUrl, label }: { entryUrl: string; label: string }): ReactNode {
+function MirrorStage({
+  entryUrl,
+  label,
+  preference,
+  services,
+}: {
+  entryUrl: string
+  label: string
+  preference: CarrierPreference
+  services: PanelServices
+}): ReactNode {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const [mode, setMode] = useState<CarrierMode>('pending')
   const [note, setNote] = useState<string>('')
@@ -278,8 +307,32 @@ function MirrorStage({ entryUrl, label }: { entryUrl: string; label: string }): 
     const acquire = bridge?.browser?.acquire
     const release = bridge?.browser?.release
 
+    // 偏好里显式要求外置承载时，不做内嵌。
+    if (preference === 'browser') {
+      window.open(entryUrl, '_blank', 'noopener')
+      setMode('external')
+      setNote('已按配置（openMode: browser）在系统浏览器打开')
+      return
+    }
+    if (preference === 'rightbar') {
+      if (services.rightbar !== undefined) {
+        services.rightbar.openTab('browser', { params: { url: entryUrl } })
+        services.layout?.openRightbar(false, true)
+        setMode('rightbar')
+        setNote('已按配置（openMode: rightbar）在右栏的浏览器标签中打开')
+      } else {
+        setMode('iframe')
+        setNote('右栏服务不可用（未启用 ui-sidebar-browser），退回内嵌框架')
+      }
+      return
+    }
+
     const useWebview = async (): Promise<boolean> => {
-      if (typeof acquire !== 'function' || typeof release !== 'function') return false
+      if (preference === 'iframe') return false
+      if (typeof acquire !== 'function' || typeof release !== 'function') {
+        if (preference === 'webview') setNote('桌面桥不可用（当前是纯 Web 外壳），退回内嵌框架')
+        return false
+      }
       try {
         const { lease, partition } = await acquire(PANEL_ID)
         if (disposed) {
@@ -326,7 +379,19 @@ function MirrorStage({ entryUrl, label }: { entryUrl: string; label: string }): 
       disposed = true
       disposeView?.()
     }
-  }, [entryUrl])
+  }, [entryUrl, preference, services])
+
+  if (mode === 'external' || mode === 'rightbar') {
+    return (
+      <div className="drd-stage">
+        <div className="drd-placeholder">
+          {note}
+          <br />
+          <span className="drd-mono">{entryUrl}</span>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="drd-stage">
@@ -360,11 +425,15 @@ function phaseText(instance: InstanceSnapshot): string {
   return '未启动'
 }
 
-function Panel(): ReactNode {
+function Panel(props: PanelServices): ReactNode {
   const { instances, error, act, refresh } = useInstances()
   const [selected, setSelected] = useState<string | undefined>(undefined)
   const [busy, setBusy] = useState<string | undefined>(undefined)
   const [checks, setChecks] = useState<CheckState | undefined>(undefined)
+  // 容器偏好来自配置；读一次即可，不必轮询。
+  const host = useHostReport()
+  const preference: CarrierPreference =
+    host.state.phase === 'ready' ? (host.state.value.config.openMode as CarrierPreference) : 'auto'
 
   const active = instances.find((instance) => instance.id === selected) ?? instances[0]
   const open = active?.phase === 'running' && typeof active.mirrorEntryUrl === 'string' ? active.mirrorEntryUrl : undefined
@@ -494,7 +563,7 @@ function Panel(): ReactNode {
                   {active.phase === 'running' ? '正在准备镜像端点…' : '实例未运行。点「启动」后这里会显示它的完整界面。'}
                 </div>
               ) : (
-                <MirrorStage entryUrl={open} label={active.label} />
+                <MirrorStage entryUrl={open} label={active.label} preference={preference} services={props} />
               )}
 
               <LogDrawer lines={logs.lines} onClear={logs.clear} />
@@ -703,7 +772,15 @@ export function apply(ctx: ClientContext): void {
   )
 
   ctx.slots.inject('main', () =>
-    ctx.slots.register({ name: 'main', key: PANEL_ID }, Panel as never),
+    // 把宿主服务随 slot 注入，面板因此能按 openMode 使用官方右栏浏览器标签。
+    ctx.slots.register(
+      {
+        name: 'main',
+        key: PANEL_ID,
+        inject: () => ({ layout: ctx.layout, rightbar: ctx.sidebarRight }),
+      },
+      Panel as never,
+    ),
   )
 
   ctx.slots.inject('settings.section', () =>

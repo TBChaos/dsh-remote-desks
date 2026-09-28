@@ -127,7 +127,7 @@ export function apply(ctx: RemoteDesksHostContext, config: RemoteDesksConfig): v
   const subprocess = (): ReturnType<typeof asSubprocess> => asSubprocess(ctx.get('subprocess'))
 
   const supervisor = new InstanceSupervisor(
-    { instances: config.instances },
+    { instances: config.instances, mirror: { portRange: config.mirror.portRange } },
     {
       dshHome,
       localRuntime: (): LocalRuntime | undefined => {

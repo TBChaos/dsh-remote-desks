@@ -287,7 +287,10 @@ check('面板调用实例列表接口', source.includes('/api/instances'))
 check('容器链含桌面 webview lease', source.includes('dshDesktop') && source.includes('about:blank#'))
 check('容器链含 iframe 兜底', source.includes('iframe'))
 check('容器链含系统浏览器兜底', source.includes('_blank'))
+check('容器链含官方右栏载体', source.includes('openTab') && source.includes('openRightbar'))
+check('容器偏好读取配置', source.includes('openMode'))
 check('面板引用了生命周期动作', source.includes('restart') && source.includes('start') && source.includes('stop'))
+check('面板有预检入口', source.includes('/check'))
 
 /* ── 4. 头重写规则（纯函数，最易悄悄回归） ── */
 

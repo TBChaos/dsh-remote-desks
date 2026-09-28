@@ -258,16 +258,7 @@ export class InstanceSupervisor {
 
       const connector = await this.connectorFor(instance, remotePort, runtime)
       runtime.upstreamDescription = connector.describe()
-      const endpoint = new MirrorEndpoint({
-        instanceId: instance.id,
-        remotePort,
-        connector,
-        cookie: () => runtime.cookie,
-        bindHost: '127.0.0.1',
-        port: 0,
-        onLog: (message) => this.append(runtime, message),
-      })
-      const info = await endpoint.start()
+      const { endpoint, info } = await this.startEndpoint(runtime, instance, remotePort, connector)
       runtime.endpoint = endpoint
       this.setPhase(runtime, 'running', `运行中，远端端口 ${String(remotePort)}`)
       this.append(runtime, `镜像入口 ${info.entryUrl}`)
@@ -335,6 +326,15 @@ export class InstanceSupervisor {
 
   /* ── 内部 ── */
 
+  /** 配置里的镜像端口范围，规范化成 [first, last]；[0,0] 表示交给操作系统。 */
+  private get portRange(): [number, number] {
+    const range = this.config.mirror?.portRange ?? []
+    const first = Number(range[0] ?? 0)
+    const last = Number(range[1] ?? first)
+    const ok = (value: number): boolean => Number.isSafeInteger(value) && value >= 0 && value <= 65535
+    return [ok(first) ? first : 0, ok(last) ? last : 0]
+  }
+
   private runtimeOf(id: string): Runtime {
     const existing = this.runtimes.get(id)
     if (existing !== undefined) return existing
@@ -363,6 +363,54 @@ export class InstanceSupervisor {
    * - WSL：先确认 Windows 能不能直连发行版里绑 127.0.0.1 的端口（镜像网络模式可以，
    *   默认 NAT 不行），不通就给明确诊断，而不是留一个永远连不上的镜像。
    */
+  /**
+   * 起镜像端点，尊重配置里的 `mirror.portRange`。
+   *
+   * 依次尝试范围内的端口，全部被占用（或范围是 [0,0]）时退回让操作系统分配——
+   * 端口冲突是可预期的，不该让实例起不来。
+   */
+  private async startEndpoint(
+    runtime: Runtime,
+    instance: RemoteDeskInstance,
+    remotePort: number,
+    connector: UpstreamConnector,
+  ): Promise<{ endpoint: MirrorEndpoint; info: { port: number; entryUrl: string; baseUrl: string } }> {
+    const range = this.portRange
+    const candidates: number[] = []
+    if (range[0] > 0) {
+      const last = range[1] >= range[0] ? range[1] : range[0]
+      for (let port = range[0]; port <= last; port += 1) candidates.push(port)
+    }
+    candidates.push(0)
+
+    let lastError: unknown
+    for (const port of candidates) {
+      const endpoint = new MirrorEndpoint({
+        instanceId: instance.id,
+        remotePort,
+        connector,
+        cookie: () => runtime.cookie,
+        bindHost: '127.0.0.1',
+        port,
+        onLog: (message) => this.append(runtime, message),
+      })
+      try {
+        const info = await endpoint.start()
+        if (port !== 0 && candidates.length > 1) {
+          this.append(runtime, `镜像端点使用配置范围内的端口 ${String(port)}`)
+        }
+        return { endpoint, info }
+      } catch (error) {
+        lastError = error
+        await endpoint.close().catch(() => undefined)
+        const code = (error as { code?: string }).code
+        if (code !== 'EADDRINUSE') throw error
+        if (port !== 0) this.append(runtime, `端口 ${String(port)} 已被占用，试下一个`)
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('镜像端点无法监听')
+  }
+
   private async connectorFor(
     instance: RemoteDeskInstance,
     remotePort: number,

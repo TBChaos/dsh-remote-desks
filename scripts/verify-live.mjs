@@ -94,7 +94,7 @@ function prepareProfile() {
       `    instances:`,
       ...instances,
       `    autoStart: ['m1-local']`,
-      `    mirror: { host: 127.0.0.1, portRange: [0, 0], openMode: auto }`,
+      `    mirror: { host: 127.0.0.1, portRange: [19500, 19510], openMode: auto }`,
       `    announce: true`,
       '',
     ].join('\n'),
@@ -367,6 +367,13 @@ async function main() {
     check('各实例端口互不相同', new Set(ports).size === ports.length, ports.join(', '))
     const mirrorPorts = concurrent.map((id) => running[id]?.mirrorBaseUrl)
     check('各镜像端点端口互不相同', new Set(mirrorPorts).size === mirrorPorts.length, mirrorPorts.join(', '))
+    // 配置把镜像端口限定在 19500-19510，所以端点应当落在范围内（而不是交给操作系统随便挑）。
+    const portNumbers = concurrent.map((id) => Number(new URL(running[id].mirrorBaseUrl).port))
+    check(
+      '镜像端口落在配置的 portRange 内',
+      portNumbers.every((port) => port >= 19500 && port <= 19510),
+      portNumbers.join(', '),
+    )
 
     const list = await get(`${base}/remote-desks/api/instances`, { cookie })
     const listed = JSON.parse(list.text)?.instances ?? []
@@ -391,6 +398,38 @@ async function main() {
       `${String(beforeRestart)} → ${String(afterRestart?.remotePort)}`,
     )
     if (afterRestart?.phase === 'running') await verifyMirrorOf(afterRestart, 'm1-local(restart 后)')
+
+    /* ── 耐久：连续启停 ── */
+    const CYCLES = 5
+    console.log(`\n[耐久] m1-local 连续启停 ${String(CYCLES)} 轮`)
+    let previousPort = afterRestart?.remotePort
+    let soakFailures = 0
+    for (let round = 1; round <= CYCLES; round += 1) {
+      await post(`${base}/remote-desks/api/instances/m1-local/stop`, { cookie })
+      const stoppedRound = await awaitPhase(base, cookie, 'm1-local', 'stopped', 30_000)
+      if (stoppedRound?.phase !== 'stopped') {
+        soakFailures += 1
+        console.log(`  FAIL 第 ${String(round)} 轮停止 — ${String(stoppedRound?.phase)}`)
+        break
+      }
+      await post(`${base}/remote-desks/api/instances/m1-local/start`, { cookie })
+      const runningRound = await awaitPhase(base, cookie, 'm1-local', 'running', 120_000)
+      if (runningRound?.phase !== 'running') {
+        soakFailures += 1
+        console.log(`  FAIL 第 ${String(round)} 轮启动 — ${String(runningRound?.phase)}：${String(runningRound?.error)}`)
+        dumpLogs(runningRound)
+        break
+      }
+      const endpointAlive = await get(runningRound.mirrorBaseUrl)
+      const okPort = runningRound.remotePort !== previousPort
+      const okEndpoint = endpointAlive.status === 403
+      console.log(
+        `  · 第 ${String(round)} 轮：端口 ${String(runningRound.remotePort)}（换端口 ${okPort ? '是' : '否'}）｜镜像端点 ${String(endpointAlive.status)}`,
+      )
+      if (!okPort || !okEndpoint) soakFailures += 1
+      previousPort = runningRound.remotePort
+    }
+    check(`连续启停 ${String(CYCLES)} 轮无异常`, soakFailures === 0, `异常 ${String(soakFailures)} 轮`)
 
     if (sshMode) {
       const sshRunning = running['m2-ssh']
