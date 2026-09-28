@@ -93,7 +93,7 @@ function prepareProfile() {
       `  config:`,
       `    instances:`,
       ...instances,
-      `    autoStart: []`,
+      `    autoStart: ['m1-local']`,
       `    mirror: { host: 127.0.0.1, portRange: [0, 0], openMode: auto }`,
       `    announce: true`,
       '',
@@ -295,6 +295,11 @@ async function main() {
     check('报告含 webServer 服务', report?.services?.webServer === true)
     check('报告含 subprocess 服务', report?.services?.subprocess === true)
     check('闸门已生效', typeof report?.control?.gate === 'string', String(report?.control?.gate))
+    check(
+      '本机运行时取自宿主自己那份（argv[1] 策略）',
+      report?.runtime?.via === 'process.argv[1]',
+      `${String(report?.runtime?.via)} → ${String(report?.runtime?.root)}`,
+    )
     check('配置里看得到实例', report?.config?.instances >= 1, String(report?.config?.instances))
 
     const forged = await get(`${base}/remote-desks/api/state`, { cookie, host: '10.1.2.3:19401' })
@@ -316,7 +321,12 @@ async function main() {
     if (sshMode) targets.push('m2-ssh')
 
     console.log(`\n[并发] 同时拉起 ${String(targets.length)} 个实例：${targets.join('、')}`)
-    for (const id of targets) {
+    // m1-local 在 autoStart 里：不点任何按钮，它应该自己起来。
+    const autoStarted = await awaitPhase(base, cookie, 'm1-local', 'running', 120_000)
+    check('autoStart 让实例自己起来', autoStarted?.phase === 'running', `${String(autoStarted?.phase)}：${String(autoStarted?.detail)}`)
+    if (autoStarted?.phase !== 'running') dumpLogs(autoStarted)
+
+    for (const id of targets.filter((entry) => entry !== 'm1-local')) {
       const started = await post(`${base}/remote-desks/api/instances/${id}/start`, { cookie }).catch((error) => ({
         status: 0,
         text: String(error),
@@ -347,6 +357,20 @@ async function main() {
     )
 
     for (const id of targets) await verifyMirrorOf(running[id], id)
+
+    // restart：应当换一个新端口重新起来（旧端点收摊、旧进程退出）。
+    const beforeRestart = running['m1-local']?.remotePort
+    const restarted = await post(`${base}/remote-desks/api/instances/m1-local/restart`, { cookie })
+    check('POST restart → 200', restarted.status === 200, String(restarted.status))
+    const afterRestart = await awaitPhase(base, cookie, 'm1-local', 'running', 120_000)
+    check('restart 后回到 running', afterRestart?.phase === 'running', `${String(afterRestart?.phase)}：${String(afterRestart?.error ?? afterRestart?.detail)}`)
+    if (afterRestart?.phase !== 'running') dumpLogs(afterRestart)
+    check(
+      'restart 换了一个远端端口',
+      typeof afterRestart?.remotePort === 'number' && afterRestart.remotePort !== beforeRestart,
+      `${String(beforeRestart)} → ${String(afterRestart?.remotePort)}`,
+    )
+    if (afterRestart?.phase === 'running') await verifyMirrorOf(afterRestart, 'm1-local(restart 后)')
 
     if (sshMode) {
       const sshRunning = running['m2-ssh']

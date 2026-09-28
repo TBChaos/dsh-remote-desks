@@ -95,26 +95,12 @@ export function probeDshRuntime(): DshRuntimeProbe {
 
   const strategies: { via: string; resolve: () => string | undefined }[] = [
     {
-      via: 'require.resolve',
-      resolve: () => {
-        try {
-          return dirname(require.resolve('@deepseek-ai/dsh/package.json'))
-        } catch {
-          return undefined
-        }
-      },
-    },
-    {
-      via: 'DSH_DESKTOP_DSH_DIR',
-      resolve: () => {
-        const value = process.env.DSH_DESKTOP_DSH_DIR
-        return value === undefined || value === '' ? undefined : join(value, 'node_modules', '@deepseek-ai', 'dsh')
-      },
-    },
-    {
+      // 最准的一条：宿主自己就是从这份运行时起的。
+      // 桌面版里 argv[1] 是 <asar>/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/index.js，
+      // 往上找到 node_modules 即命中 asar 内的发行版——与桌面应用自己启动 host 用的那份完全一致，
+      // 不会出现"桌面跑 A 版、我们拉起的实例跑 B 版"的错位。
       via: 'process.argv[1]',
       resolve: () => {
-        // 桌面版的 host 子进程入口是 <dsh>/node_modules/@deepseek-ai/dsh-desktop-host/lib/index.js
         const argv1 = process.argv[1]
         if (argv1 === undefined || argv1 === '') return undefined
         let current = dirname(argv1)
@@ -125,6 +111,24 @@ export function probeDshRuntime(): DshRuntimeProbe {
           current = parent
         }
         return undefined
+      },
+    },
+    {
+      via: 'DSH_DESKTOP_DSH_DIR',
+      resolve: () => {
+        const value = process.env.DSH_DESKTOP_DSH_DIR
+        return value === undefined || value === '' ? undefined : join(value, 'node_modules', '@deepseek-ai', 'dsh')
+      },
+    },
+    {
+      // 非桌面环境（或宿主本身不是从发行版起的）才会走到这里。
+      via: 'require.resolve',
+      resolve: () => {
+        try {
+          return dirname(require.resolve('@deepseek-ai/dsh/package.json'))
+        } catch {
+          return undefined
+        }
       },
     },
     {

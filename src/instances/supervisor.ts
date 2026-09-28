@@ -68,6 +68,13 @@ interface Runtime {
   lines: string[]
   /** lines[0] 的全局行号，客户端据此增量拉取。 */
   base: number
+  /**
+   * 本轮启动的日志起点（全局行号）。
+   *
+   * 必须记住它：日志环是跨轮次保留的，上一次运行的就绪行还在里面——不划清界限的话，
+   * 重启时会立刻"找到"上一轮的 URL，拿着旧端口去换 cookie（实测就是这个症状）。
+   */
+  readyFromGlobal: number
   poll?: NodeJS.Timeout
   busy: boolean
 }
@@ -148,6 +155,8 @@ export class InstanceSupervisor {
     this.setPhase(runtime, 'starting', '正在拉起实例')
     runtime.error = undefined
     runtime.exit = undefined
+    // 只在本轮新增的日志里找就绪行，避免撞上上一轮遗留的那一条。
+    runtime.readyFromGlobal = runtime.base + runtime.lines.length
 
     try {
       const plan = planFor(instance, this.deps.localRuntime(), this.deps.dshHome)
@@ -326,6 +335,7 @@ export class InstanceSupervisor {
       stderrOffset: 0,
       stdoutPending: '',
       stderrPending: '',
+      readyFromGlobal: 0,
       busy: false,
     }
     this.runtimes.set(id, created)
@@ -373,7 +383,9 @@ export class InstanceSupervisor {
     while (Date.now() < deadline) {
       await delay(POLL_INTERVAL_MS)
       if (runtime.exit !== undefined) return undefined
-      const found = findReadyUrl(runtime.lines.join('\n'))
+      // 只看本轮日志：日志环跨轮次保留，上一轮的就绪行仍然躺在里面。
+      const start = Math.max(0, runtime.readyFromGlobal - runtime.base)
+      const found = findReadyUrl(runtime.lines.slice(start).join('\n'))
       if (found !== undefined) return found
     }
     return undefined
