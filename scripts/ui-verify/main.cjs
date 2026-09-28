@@ -193,6 +193,39 @@ async function main() {
     fs.writeFileSync(path.join(outDir, 'panel-stopped.png'), (await wc.capturePage()).toPNG())
   }
 
+  // 4b. 一键诊断：用户不用描述现象，点一下就能把状态贴出来
+  if (panelUp && expectStage !== 'gone' && expectStage !== 'loose') {
+    const clicked = await js(`
+      (() => {
+        const button = Array.from(document.querySelectorAll('.drd-bar button'))
+          .find((node) => (node.textContent ?? '').trim() === '复制诊断')
+        if (button === undefined) return false
+        button.click()
+        return true
+      })()
+    `)
+    record('点得到「复制诊断」', clicked === true)
+    const report = await waitFor('!!document.querySelector(".drd-root textarea")', 10_000, '诊断文本出现')
+    if (report) {
+      const text = await js('document.querySelector(".drd-root textarea").value')
+      record('诊断文本含标题', String(text).includes('dsh-remote-desks 诊断'), String(text).slice(0, 40))
+      record('诊断文本含实例与状态', String(text).includes('本机预演实例') || String(text).includes('ui-local'), '')
+      record('诊断文本含容器说明', String(text).includes('容器说明'), String(text).split('\n').find((line) => line.includes('容器说明')) ?? '')
+      record('诊断文本含日志尾部', String(text).includes('日志尾部'), '')
+      fs.writeFileSync(path.join(outDir, 'diagnostics.txt'), String(text))
+      // 关掉它再往下走：诊断面板的文字会混进后面那些 .drd-meta 的断言里。
+      await js(`
+        (() => {
+          const button = Array.from(document.querySelectorAll('.drd-root button'))
+            .find((node) => (node.textContent ?? '').trim() === '关闭')
+          if (button !== undefined) button.click()
+          return true
+        })()
+      `)
+      await wait(500)
+    }
+  }
+
   // 5. 点启动 → 等运行中（rightbar 模式已由驱动脚本经 HTTP 预启动，面板也会让位）
   if (panelUp && expectStage !== 'gone' && expectStage !== 'loose' && !skipStart) {
     const clicked = await js(`

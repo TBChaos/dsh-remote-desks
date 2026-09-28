@@ -301,11 +301,14 @@ function MirrorStage({
   label,
   preference,
   services,
+  onNote,
 }: {
   entryUrl: string
   label: string
   preference: CarrierPreference
   services: PanelServices
+  /** 把当前那行说明回带出去（诊断文本要用）。 */
+  onNote?: (value: string) => void
 }): ReactNode {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const [mode, setMode] = useState<CarrierMode>('pending')
@@ -496,6 +499,10 @@ function MirrorStage({
       disposeView?.()
     }
   }, [entryUrl, preference, services])
+
+  useEffect(() => {
+    onNote?.(note)
+  }, [note, onNote])
 
   if (mode === 'external' || mode === 'rightbar') {
     return (
@@ -701,6 +708,10 @@ function Panel(props: PanelServices): ReactNode {
   const [selected, setSelected] = useState<string | undefined>(undefined)
   const [busy, setBusy] = useState<string | undefined>(undefined)
   const [checks, setChecks] = useState<CheckState | undefined>(undefined)
+  const [diagnostics, setDiagnostics] = useState<string | undefined>(undefined)
+  const [diagnosticsNote, setDiagnosticsNote] = useState<string>('')
+  /** 镜像区当前那行说明（哪种容器/降级原因）——诊断文本里最有用的一行，通过回调带上来。 */
+  const carrierNoteRef = useRef<string>('')
   // 容器偏好来自配置；读一次即可，不必轮询。
   const host = useHostReport()
   const preference: CarrierPreference =
@@ -716,6 +727,58 @@ function Panel(props: PanelServices): ReactNode {
       await act(id, action)
     } finally {
       setBusy(undefined)
+    }
+  }
+
+  /**
+   * 一键攒一份诊断文本：能力矩阵 + 每个实例的状态/版本/最近更新 + 当前实例的日志尾部。
+   *
+   * 起因很实际——"界面上是什么样"用嘴描述很费劲。用户点一下就拿到一段可以直接粘的文本，
+   * 排障时不用来回问。复制失败（无剪贴板权限）就退化成显示出来手动选。
+   */
+  const collectDiagnostics = async (): Promise<void> => {
+    const lines: string[] = ['===== dsh-remote-desks 诊断 =====']
+    lines.push(`生成时间：${new Date().toISOString()}`)
+    try {
+      const state = (await (await fetch(STATE_URL)).json()) as Record<string, unknown>
+      const host = (state.host ?? {}) as Record<string, unknown>
+      const cap = (state.capabilities ?? {}) as Record<string, unknown>
+      lines.push(`运行形态：${String(host.platform ?? '未知')}｜DSH 入口：${String(host.entry ?? '未知')}`)
+      lines.push(`运行入口来源：${String(cap.entrySource ?? '未知')}`)
+      const gate = (state.gate ?? {}) as Record<string, unknown>
+      lines.push(`控制接口闸门：${String(gate.mode ?? gate.description ?? JSON.stringify(gate))}`)
+      lines.push(`容器偏好（openMode）：${preference}`)
+      lines.push(`实例数：${String(instances.length)}`)
+    } catch (error) {
+      lines.push(`读取能力矩阵失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+    for (const instance of instances) {
+      lines.push(
+        `- [${instance.id}] ${instance.kind} ${instance.phase}` +
+          `${instance.version === undefined ? '' : `｜DSH ${instance.version}`}` +
+          `${instance.remotePort === undefined ? '' : `｜远端端口 ${String(instance.remotePort)}`}` +
+          `｜${instance.detail}` +
+          `${instance.error === undefined ? '' : `｜错误：${instance.error}`}`,
+      )
+      if (instance.lastUpdate !== undefined) {
+        lines.push(
+          `    上次${instance.lastUpdate.kind === 'update' ? '更新' : '回滚'}：` +
+            `${instance.lastUpdate.from ?? '未知'} → ${instance.lastUpdate.to ?? '未知'}｜${instance.lastUpdate.detail}`,
+        )
+      }
+    }
+    if (active !== undefined) {
+      lines.push(`当前选中：${active.id}｜容器说明：${carrierNoteRef.current === '' ? '（镜像未显示）' : carrierNoteRef.current}`)
+      lines.push(`---- 日志尾部（${active.id}）----`)
+      for (const line of logs.lines.slice(-40)) lines.push(line)
+    }
+    const text = lines.join('\n')
+    setDiagnostics(text)
+    try {
+      await navigator.clipboard.writeText(text)
+      setDiagnosticsNote('已复制到剪贴板')
+    } catch {
+      setDiagnosticsNote('复制失败，请手动全选下面的文本')
     }
   }
 
@@ -743,10 +806,45 @@ function Panel(props: PanelServices): ReactNode {
         <h1 className="drd-title">{DISPLAY_NAME}</h1>
         <span className="drd-badge">{instances.length === 0 ? '未配置实例' : `${String(instances.length)} 个实例`}</span>
         <div className="drd-spacer" />
+        <button
+          type="button"
+          className="drd-btn"
+          title="把能力矩阵、每个实例的状态与版本、当前容器说明和日志尾部攒成一段文本，方便贴给别人排查"
+          onClick={() => void collectDiagnostics()}
+        >
+          复制诊断
+        </button>
         <button type="button" className="drd-btn" onClick={() => void refresh()}>
           刷新
         </button>
       </div>
+
+      {diagnostics === undefined ? null : (
+        <div style={{ padding: '10px 18px', borderBottom: '1px solid var(--dsw-alias-border-l1, currentColor)' }}>
+          <div className="drd-meta" style={{ marginBottom: 6, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span>{diagnosticsNote}</span>
+            <button type="button" className="drd-btn" onClick={() => setDiagnostics(undefined)}>
+              关闭
+            </button>
+          </div>
+          <textarea
+            readOnly
+            value={diagnostics}
+            onFocus={(event) => event.currentTarget.select()}
+            style={{
+              width: '100%',
+              height: 160,
+              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+              fontSize: 12,
+              background: 'var(--dsw-alias-bg-layer-1, transparent)',
+              color: 'inherit',
+              border: '1px solid var(--dsw-alias-border-l1, currentColor)',
+              borderRadius: 6,
+              padding: 8,
+            }}
+          />
+        </div>
+      )}
 
       {error === undefined ? null : <div className="drd-error">控制接口报错：{error}</div>}
 
@@ -790,7 +888,15 @@ function Panel(props: PanelServices): ReactNode {
                   {active.phase === 'running' ? '正在准备镜像端点…' : '实例未运行。点「启动」后这里会显示它的完整界面。'}
                 </div>
               ) : (
-                <MirrorStage entryUrl={open} label={active.label} preference={preference} services={props} />
+                <MirrorStage
+                  entryUrl={open}
+                  label={active.label}
+                  preference={preference}
+                  services={props}
+                  onNote={(value) => {
+                    carrierNoteRef.current = value
+                  }}
+                />
               )}
 
               <LogDrawer lines={logs.lines} onClear={logs.clear} />
