@@ -282,6 +282,13 @@ check('注册了 main 面板 key', mainPanel?.key === 'remote-desks', String(mai
 check('sidebar 入口带中文标签', typeof panelEntry?.label === 'function' && panelEntry.label() === '远端工作台')
 check('注册总数=3', registered.length === 3, `实际 ${registered.length}`)
 
+// 面板与控制接口/镜像容器链路的接线（静态检查，防回归）
+check('面板调用实例列表接口', source.includes('/api/instances'))
+check('容器链含桌面 webview lease', source.includes('dshDesktop') && source.includes('about:blank#'))
+check('容器链含 iframe 兜底', source.includes('iframe'))
+check('容器链含系统浏览器兜底', source.includes('_blank'))
+check('面板引用了生命周期动作', source.includes('restart') && source.includes('start') && source.includes('stop'))
+
 /* ── 4. 头重写规则（纯函数，最易悄悄回归） ── */
 
 console.log('\n[4] 镜像代理的头重写')
