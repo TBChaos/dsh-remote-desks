@@ -21,8 +21,13 @@
 dsh plugin --profile desktop add D:\code\dsh-remote-desks
 #    或者用桌面版设置里的 Plugins 页安装
 
-# 2) 重启桌面应用（启动型 profile，新 bundle 行必须重启才加载）
+# 2) 完整重启桌面应用
 ```
+
+> **改完必须完整重启，刷新窗口不够。** 这一条是实测出来的（`node scripts/probe-client-reload.mjs`）：
+> 宿主在**启动时**就把各插件的客户端 bundle读进内存了（bundle 地址带 `?rev=<内容哈希>`，
+> 内容在启动那一刻定死）。所以哪怕只改了客户端那半边，刷新页面也拿不到新代码——
+> 这里踩过一次，写下来免得再猜。
 
 重启后侧栏会出现 **「远端工作台」** 入口（在「插件」下面）。此时还没有实例，把下面三段里
 你需要的抄进 `C:\Users\<你>\.dsh\profiles\desktop\cordis.patch.yml`：
@@ -418,6 +423,10 @@ scripts/
   build-client.mjs      客户端 bundle 打包（__ModuleLoader__ 外壳）
   smoke.mjs             载入期冒烟测试
   verify-live.mjs       活体验证：起真实实例跑端到端（M1 启动器的最小原型）
+  verify-ui.mjs         真实浏览器驱动界面（六种容器档）
+  verify-electron-local.mjs  用桌面自带运行时预演"点启动"
+  probe-client-reload.mjs    实测"改客户端要不要重启"（结论：要）
+  ssh-test-server.mjs   测试用 SSH 对端（exec 与 direct-tcpip 转给 WSL）
 cordis.patch.yml        bundle patch（安装时并入 profile）
 .recon/                 侦察产物（解包的 DSH 发行版源码 + 笔记），已 gitignore
 ```
