@@ -111,6 +111,27 @@ dsh plugin --profile desktop add <本目录路径>
 注入启动时换好的远端会话 cookie，并剥掉 `content-security-policy` / `x-frame-options`
 （否则嵌不进来）与逐跳头，同时把 `set-cookie` 归一成属于镜像 origin 的形态。
 
+### 两个镜像相关的配置项
+
+```yaml
+mirror:
+  host: 127.0.0.1          # 只允许回环
+  portRange: [19500, 19510] # 端点在这个范围内找空位；全占满则退回系统分配
+  openMode: auto            # 容器偏好，见下表
+```
+
+`openMode` 决定镜像用哪种容器承载，四种取值都真的生效（不是解析完就放着）：
+
+| 取值 | 行为 |
+|---|---|
+| `auto`（默认） | 桌面走官方 webview lease → 失败退内嵌框架 → 再退系统浏览器 |
+| `webview` | 强制桌面原生视图；不可用时说明原因并退回内嵌框架 |
+| `iframe` | 跳过 webview，直接用内嵌框架（纯 Web 版等价形态） |
+| `browser` | 不做内嵌，直接交给系统浏览器打开 |
+| `rightbar` | 走**官方右栏浏览器标签**（`ctx.sidebarRight.openTab('browser', …)` + 全屏右栏），宿主没启用该插件时退回内嵌框架 |
+
+面板上会写明当前用的是哪种容器，方便对着现象排查。
+
 ## WSL 的三条硬约束（都实测过）
 
 写 WSL 启动命令时踩到的坑，已固化在默认命令里：

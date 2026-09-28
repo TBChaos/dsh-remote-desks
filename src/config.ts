@@ -50,8 +50,6 @@ export interface RemoteDeskInstance {
   launchCommand?: string
   /** 覆盖更新命令（更新功能尚未启用，先保留字段）。 */
   updateCommand?: string
-  /** 远端工作根目录（用于展示与后续功能）。 */
-  remoteRoot?: string
 }
 
 export type MirrorOpenMode = 'auto' | 'webview' | 'rightbar' | 'iframe' | 'browser'
@@ -118,7 +116,6 @@ const Instance = Schema.object({
 
   launchCommand: Schema.string(),
   updateCommand: Schema.string(),
-  remoteRoot: Schema.string(),
 })
 
 export const Config: Schema<RemoteDesksConfig> = Schema.object({

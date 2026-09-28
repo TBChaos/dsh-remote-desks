@@ -62,7 +62,7 @@ export type SupervisorConfig = RemoteDesksConfig
 /** 只关心实例列表与镜像设置的最小配置视图，便于测试与复用。 */
 export interface InstanceConfigSource {
   instances: RemoteDeskInstance[]
-  mirror?: { portRange: number[] }
+  mirror?: { host?: string; portRange: number[] }
 }
 
 export function instanceById(

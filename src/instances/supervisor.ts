@@ -390,7 +390,7 @@ export class InstanceSupervisor {
         remotePort,
         connector,
         cookie: () => runtime.cookie,
-        bindHost: '127.0.0.1',
+        bindHost: this.config.mirror?.host ?? '127.0.0.1',
         port,
         onLog: (message) => this.append(runtime, message),
       })
