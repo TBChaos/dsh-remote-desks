@@ -9,6 +9,8 @@ export interface ControlApi {
   stop(id: string): Promise<unknown>
   restart(id: string): Promise<unknown>
   logs(id: string, offset: number): unknown
+  /** 启动前预检：不拉起实例，只列出缺什么。 */
+  check(id: string): Promise<unknown>
 }
 
 export interface ControlRouteOptions {
@@ -122,6 +124,20 @@ export function createControlHandler(options: ControlRouteOptions) {
         return
       }
       sendJson(res, 200, view)
+      return
+    }
+
+    const checkRoute = /^\/api\/instances\/([^/]+)\/check$/.exec(route)
+    if (method === 'GET' && checkRoute !== null) {
+      const id = decodeURIComponent(checkRoute[1] ?? '')
+      options.api.check(id).then(
+        (result) => sendJson(res, 200, result),
+        (error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          const missing = message.includes('没有这个实例')
+          sendJson(res, missing ? 404 : 500, { error: missing ? 'not-found' : 'check-failed', id, message })
+        },
+      )
       return
     }
 

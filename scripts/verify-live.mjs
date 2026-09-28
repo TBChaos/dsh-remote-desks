@@ -320,6 +320,26 @@ async function main() {
     if (wslDistro !== '') targets.push('m1-wsl')
     if (sshMode) targets.push('m2-ssh')
 
+    /* ── 预检：不启动实例就能看清缺什么 ── */
+    console.log('\n[预检] 静态检查（不拉起实例）')
+    for (const id of targets) {
+      const checked = await get(`${base}/remote-desks/api/instances/${id}/check`, { cookie })
+      check(`${id} 预检 → 200`, checked.status === 200, String(checked.status))
+      let items = []
+      try {
+        items = JSON.parse(checked.text)?.checks ?? []
+      } catch {
+        items = []
+      }
+      check(`${id} 预检有明细`, items.length > 0, items.map((item) => `${item.name}:${item.ok ? 'ok' : 'x'}`).join(', '))
+      // 配置本身正确，所以除了"运行时/远端环境"这类环境项，其余都应当通过。
+      const failed = items.filter((item) => !item.ok)
+      console.log(`  · ${id} 预检：${items.length} 项，未通过 ${String(failed.length)} 项${failed.length === 0 ? '' : `（${failed.map((item) => item.name).join('、')}）`}`)
+    }
+    const unknown = await get(`${base}/remote-desks/api/instances/nope/check`, { cookie })
+    check('预检未知实例 → 404', unknown.status === 404, String(unknown.status))
+
+    /* ── 并发启动 ── */
     console.log(`\n[并发] 同时拉起 ${String(targets.length)} 个实例：${targets.join('、')}`)
     // m1-local 在 autoStart 里：不点任何按钮，它应该自己起来。
     const autoStarted = await awaitPhase(base, cookie, 'm1-local', 'running', 120_000)

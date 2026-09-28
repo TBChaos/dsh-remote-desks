@@ -364,6 +364,7 @@ function Panel(): ReactNode {
   const { instances, error, act, refresh } = useInstances()
   const [selected, setSelected] = useState<string | undefined>(undefined)
   const [busy, setBusy] = useState<string | undefined>(undefined)
+  const [checks, setChecks] = useState<CheckState | undefined>(undefined)
 
   const active = instances.find((instance) => instance.id === selected) ?? instances[0]
   const open = active?.phase === 'running' && typeof active.mirrorEntryUrl === 'string' ? active.mirrorEntryUrl : undefined
@@ -431,6 +432,27 @@ function Panel(): ReactNode {
                 <button
                   type="button"
                   className="drd-btn"
+                  disabled={busy !== undefined}
+                  onClick={() => {
+                    setChecks({ phase: 'loading' })
+                    fetch(`${INSTANCES_URL}/${encodeURIComponent(active.id)}/check`, {
+                      headers: { accept: 'application/json' },
+                    })
+                      .then(async (response) => {
+                        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+                        const body = (await response.json()) as { checks?: PreflightItem[] }
+                        setChecks({ phase: 'ready', items: body.checks ?? [] })
+                      })
+                      .catch((error: unknown) =>
+                        setChecks({ phase: 'error', message: error instanceof Error ? error.message : String(error) }),
+                      )
+                  }}
+                >
+                  预检
+                </button>
+                <button
+                  type="button"
+                  className="drd-btn"
                   disabled={active.phase === 'running' || busy !== undefined}
                   onClick={() => void run(active.id, 'start')}
                 >
@@ -464,6 +486,8 @@ function Panel(): ReactNode {
                   浏览器打开
                 </button>
               </div>
+
+              {checks === undefined ? null : <CheckList state={checks} onClose={() => setChecks(undefined)} />}
 
               {open === undefined ? (
                 <div className="drd-placeholder">
@@ -511,6 +535,42 @@ function LogDrawer({ lines, onClear }: { lines: string[]; onClear: () => void })
         </pre>
       ) : null}
     </>
+  )
+}
+
+interface PreflightItem {
+  name: string
+  ok: boolean
+  detail: string
+}
+
+type CheckState = { phase: 'loading' } | { phase: 'ready'; items: PreflightItem[] } | { phase: 'error'; message: string }
+
+/** 预检结果：一行一项，红绿一眼可见。 */
+function CheckList({ state, onClose }: { state: CheckState; onClose: () => void }): ReactNode {
+  if (state.phase === 'loading') return <div className="drd-card">正在预检…</div>
+  if (state.phase === 'error') return <div className="drd-error">预检失败：{state.message}</div>
+  return (
+    <div className="drd-card">
+      <h3>
+        预检结果
+        <button type="button" className="drd-btn" style={{ marginLeft: 10 }} onClick={onClose}>
+          收起
+        </button>
+      </h3>
+      <div className="drd-grid">
+        {state.items.map((item) => (
+          <Row key={item.name} label={item.name}>
+            <span className="drd-chip" data-on={item.ok ? 'true' : 'false'}>
+              {item.ok ? '通过' : '不通过'}
+            </span>
+            <span className="drd-mono" style={{ marginLeft: 8 }}>
+              {item.detail}
+            </span>
+          </Row>
+        ))}
+      </div>
+    </div>
   )
 }
 

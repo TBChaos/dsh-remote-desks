@@ -78,7 +78,16 @@ dsh plugin --profile desktop add <本目录路径>
 | `GET` | `/remote-desks/api/instances` | 全部实例的运行时快照 |
 | `GET` | `/remote-desks/api/instances/:id` | 单个实例快照（含 `phase` / 镜像地址 / 退出码） |
 | `GET` | `/remote-desks/api/instances/:id/logs?offset=N` | 增量拉日志（行号偏移，环形缓冲 600 行） |
+| `GET` | `/remote-desks/api/instances/:id/check` | **预检**：不启动实例，只列出缺什么 |
 | `POST` | `/remote-desks/api/instances/:id/start\|stop\|restart` | 生命周期操作 |
+
+**预检**（面板工具栏上的「预检」按钮）回答的是"点了启动会不会失败"：
+
+- 本机：运行时入口是否存在、启动方式（Electron Node 模式 / node）、工作目录、`DSH_HOME`、profile 状态
+- WSL：发行版能否进入、里面有没有 node 与 dsh、启动命令
+- SSH：端口是否可达、认证材料是否齐（私钥可读 / 凭据已配置 / agent 存在）、跳板逐跳可达
+
+检查项都是廉价只读探测，不产生副作用；失败项会直接给出"缺什么"而不是一句报错。
 
 **两道闸门叠加**，缺一不可：
 

@@ -6,6 +6,7 @@ import type { RemoteDeskInstance } from '../config.js'
 import { SshConnection } from '../ssh/manager.js'
 import { sshProcessHandle } from '../ssh/process.js'
 import { exchangeSession, findReadyUrl } from './readiness.js'
+import { preflight, type PreflightCheck } from './preflight.js'
 import { planFor } from './spec.js'
 import {
   instanceById,
@@ -135,6 +136,18 @@ export class InstanceSupervisor {
     if (runtime === undefined) return undefined
     const start = Math.max(0, offset - runtime.base)
     return { nextOffset: runtime.base + runtime.lines.length, lines: runtime.lines.slice(start) }
+  }
+
+  /** 启动前预检：不拉起实例，只回答"缺什么"。 */
+  async check(id: string): Promise<{ id: string; checks: PreflightCheck[] }> {
+    const instance = instanceById(this.config, id)
+    if (instance === undefined) throw new Error(`没有这个实例：${id}`)
+    const checks = await preflight(instance, {
+      localRuntime: this.deps.localRuntime,
+      dshHome: this.deps.dshHome,
+      resolveCredential: this.deps.resolveCredential,
+    })
+    return { id, checks }
   }
 
   async start(id: string): Promise<InstanceSnapshot> {
