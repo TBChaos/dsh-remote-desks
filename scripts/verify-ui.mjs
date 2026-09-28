@@ -94,11 +94,24 @@ const EXPECTATIONS = {
   // 即便手工启用，标签建起来了但右栏不一定真的打开——所以这里**不做严格断言**，
   // 只要求"不崩、有说明文字"，其余交给文档明说。
   rightbar: { stage: 'loose', note: '', mirrorFrame: 'any', createSession: true, preStart: true },
+  // 桌面版那条路的**客户端一半**：页面就绪后注入最小桌面桥 → 走 openMode: webview →
+  // 验证我们的挂载序列（partition 先于 src、about:blank#<lease>、dom-ready 后导航）
+  // 真能把远端界面装进 webview，并在宿主侧确认 guest 的存在与内容。
+  // 主进程那半边（will-attach-webview 的放行规则）仍只有真桌面应用能验。
+  'webview-client': {
+    stage: 'webview',
+    note: '桌面原生视图',
+    mirrorFrame: 'guest',
+    injectBridge: true,
+    configMode: 'webview',
+  },
 }
 
 async function runOnce(openMode, outDir, electron) {
   console.log(`\n=== openMode: ${openMode} ===`)
-  prepareProfile(openMode)
+  // 验收项名字（如 webview-client）不一定等于配置里的 openMode，这里必须用后者——
+  // 传错值会让 schema 拒掉整份配置，面板只会说"未配置实例"，很难看出是脚本自己的锅。
+  prepareProfile(EXPECTATIONS[openMode]?.configMode ?? openMode)
   if (pnpmEntry !== '') {
     const install = spawnSync(nodeBin, [pnpmEntry, 'install', '--dir', profileDir], { encoding: 'utf8' })
     if (install.status !== 0) {
@@ -180,6 +193,7 @@ async function runOnce(openMode, outDir, electron) {
     delete electronEnv.ELECTRON_RUN_AS_NODE
     if (skipStart || preStarted) electronEnv.UI_SKIP_START = '1'
     if (expectation.createSession === true) electronEnv.UI_CREATE_SESSION = '1'
+    if (expectation.injectBridge === true) electronEnv.UI_INJECT_BRIDGE = '1'
 
     const child = spawn(electron, [join(root, 'scripts', 'ui-verify', 'main.cjs')], {
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -200,7 +214,7 @@ async function runOnce(openMode, outDir, electron) {
         for (const step of failed) console.error(`  - ${step.name} — ${step.detail}`)
         process.exitCode = 1
       } else {
-        console.log(`openMode=${openMode} 通过（${String(results.steps.length)} 项）｜截图 ${outDir}`)
+        console.log(`openMode=${openMode} 通过（${String((results.steps ?? []).length)} 项）｜截图 ${outDir}`)
       }
     } else {
       console.error(`openMode=${openMode} 没有产出结果（浏览器退出码 ${String(exitCode)}）`)

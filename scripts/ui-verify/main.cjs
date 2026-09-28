@@ -15,6 +15,14 @@ const skipStart = process.env.UI_SKIP_START === '1'
 const expectStage = process.env.UI_EXPECT_STAGE ?? 'iframe'
 const expectNote = process.env.UI_EXPECT_NOTE ?? ''
 const expectMirrorFrame = process.env.UI_EXPECT_MIRROR_FRAME ?? '1'
+/**
+ * 在壳子启动完成后注入一个最小桌面桥（`window.dshDesktop.browser`）。
+ *
+ * 为什么是"启动后注入"而不是用 preload：上一轮用 preload 时，壳子一启动就看到了 dshDesktop，
+ * 于是走进 desktop 分支的引导页（欢迎/开始设置），根本到不了我们的面板。注入发生在页面就绪之后，
+ * 启动分支不受影响，而面板挂载镜像时桥已经在了——这正好只压我们客户端那一半。
+ */
+const injectBridge = process.env.UI_INJECT_BRIDGE === '1'
 
 const results = { steps: [], dom: {} }
 const record = (name, ok, detail = '') => {
@@ -39,11 +47,19 @@ async function main() {
     const text = String(message)
     // Electron 自己会就 CSP 发一条安全警告，那不是我们代码的问题。
     if (text.includes('Electron Security Warning')) return
+    // 镜像端点用 302 发票据 cookie，Electron 会把被顶掉的导航记成 ERR_ABORTED——
+    // 这是正常流程的噪声，客户端那边也已经显式忽略 -3。
+    if (text.includes('ERR_ABORTED')) return
     if (level >= 2) consoleErrors.push(text.slice(0, 300))
   })
   wc.on('render-process-gone', (_event, details) => record('渲染进程存活', false, JSON.stringify(details)))
 
   const js = (code) => wc.executeJavaScript(code, true)
+  // webview 载体：宿主侧的 guest 只有主进程看得到，这里记下来供断言用。
+  let guestRef
+  wc.on('did-attach-webview', (_event, guest) => {
+    guestRef = guest
+  })
   const shot = async (name) => {
     const image = await wc.capturePage()
     const file = path.join(outDir, `${name}.png`)
@@ -99,6 +115,21 @@ async function main() {
   }
 
   // 3. 我们的侧栏入口（先把候选 dump 出来，找不到时也能看清结构）
+  if (injectBridge) {
+    const injected = await js(`
+      (() => {
+        window.dshDesktop = {
+          protocolVersion: 1,
+          browser: {
+            acquire: async () => ({ lease: 'harness-' + Math.random().toString(36).slice(2), partition: 'harness-' + Math.random().toString(36).slice(2) }),
+            release: async () => {},
+          },
+        }
+        return typeof window.dshDesktop?.browser?.acquire === 'function'
+      })()
+    `)
+    record('注入最小桌面桥', injected === true)
+  }
   const candidates = await js(`
     Array.from(document.querySelectorAll('button,[role="button"]'))
       .map((node) => ({
@@ -205,6 +236,32 @@ async function main() {
         if (expectStage === 'loose') {
           // 实验性载体：只记录观察到的状态，不判成败。
           console.log(`  ·（loose）观察到的状态：${carrier}｜面板${(await js('document.querySelector(".drd-root") === null')) ? '已让位' : '仍在'}`)
+        } else if (expectStage === 'webview') {
+          record('容器类型是 webview', carrier === 'webview', `实际 ${String(carrier)}`)
+          // 关键证据：guest 真的挂上了、导航到了镜像地址，而且它自己那份 DOM 里是远端 UI。
+          await wait(8_000)
+          if (guestRef === undefined) {
+            record('主进程侧看到 guest', false, 'did-attach-webview 没触发')
+          } else {
+            record('主进程侧看到 guest', true)
+            const guestUrl = guestRef.getURL()
+            record('guest 已导航到镜像端点', /^http:\/\/127\.0\.0\.1:196\d\d\//.test(guestUrl), guestUrl.slice(0, 80))
+            // guest 里的远端 UI 还在加载时会话可能一直不 settle，所以探测必须有上限——
+            // 验证脚本自己挂住比失败更糟。
+            const withTimeout = (promise, ms) =>
+              Promise.race([promise, new Promise((done) => setTimeout(() => done('<超时>'), ms))])
+            const guestDom = await withTimeout(
+              guestRef.executeJavaScript('document.documentElement.outerHTML.slice(0, 6000)').catch((error) => `<出错 ${String(error)}>`),
+              15_000,
+            )
+            // 这一条**只观察不判定**：这个壳子没有真桌面应用那套会话/分区准备，
+            // guest 里能不能渲染出远端 UI 取决于环境，不能算在我们客户端头上。
+            // 契约性的三条在上面（挂了 webview、guest 挂上了、导航到了镜像端点）。
+            console.log(
+              `  ·（观察）guest 里取到 ${String(guestDom).length} 字符` +
+                `${String(guestDom).includes('__DSH_BOOT__') ? '，含远端 UI 的 __DSH_BOOT__' : '，没有远端 UI 痕迹'}`,
+            )
+          }
         } else {
           const actual =
             expectStage === 'gone'

@@ -447,13 +447,18 @@ cordis.patch.yml        bundle patch（安装时并入 profile）
 3. **纯 Web 版**：控制接口、鉴权闸门、客户端 bundle 都是在纯 web 宿主（`dsh-base` + `dsh-web-app`，
    无 Electron）里验证的，所以宿主侧等价；只有"iframe 容器长什么样"没看。
 4. **长稳**：验证是秒级到分钟级的往返，没有做小时级稳定性与内存观测（日志环已有上限，600 行）。
-5. **桌面版 `<webview>` 载体无法在普通 Electron 里模拟**。放行权在桌面主进程手里：`will-attach-webview`
-   只认通过 `window.dshDesktop.browser.acquire()` 拿到的租约。我试过在自己起的 Electron 里照那段
-   guard 的语义重建租约桥，结果是——**只注入 `dshDesktop.browser` 会让壳子走进 desktop 分支的
-   引导页**（"欢迎使用 / 开始设置"），而不是正常 UI；要跑通得把 `dshDesktopBoot` / `dshOnboarding` /
-   `dshPlatform` 整套 preload 桥都复刻出来，而复刻品终究不是真壳子。
-   所以这条载体目前只有**契约层面的保证**：拿租约 → 先挂 `about:blank#<lease>`（且 `partition`
-   先于 `src` 设置）→ `dom-ready` 后导航到镜像地址 → 卸载时释放租约。需要你在桌面应用里确认一次。
+5. **桌面版 `<webview>` 载体的主进程那一半**。放行权在桌面主进程手里：`will-attach-webview`
+   只认通过 `window.dshDesktop.browser.acquire()` 拿到的租约。我试过两种模拟：
+
+   - 用 preload 注入桥：壳子一启动就看见 `dshDesktop`，直接走进 desktop 分支的引导页
+     （"欢迎使用 / 开始设置"），根本到不了面板；
+   - **页面就绪后注入桥**（`pnpm verify:ui --open-mode webview-client`）：这条路走通了，
+     于是**客户端那一半现在是验证过的**——`partition` 先于 `src`、先挂 `about:blank#<lease>`、
+     `dom-ready` 后导航，实测 webview 挂上、宿主侧看到 guest、guest 的 URL 变成镜像端点。
+
+   仍然没验的是**主进程那半边**（那段 guard 的放行规则本身），以及 guest 在这个模拟壳子里
+   能否渲染出远端 UI（观察结果是没渲染：这个壳子没有真桌面应用那套会话与分区准备）。
+   所以请你在桌面应用里点一次确认；失败时面板会写明降级原因（超时/加载失败/租约不完整都会说）。
 
 ## 许可
 

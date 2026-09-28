@@ -316,6 +316,7 @@ function MirrorStage({
     if (host === null) return
     let disposed = false
     let disposeView: (() => void) | undefined
+    let watchdog: ReturnType<typeof setTimeout> | undefined
 
     const bridge = (window as unknown as { dshDesktop?: DesktopBridge }).dshDesktop
     const acquire = bridge?.browser?.acquire
@@ -374,10 +375,17 @@ function MirrorStage({
         return false
       }
       try {
-        const { lease, partition } = await acquire(PANEL_ID)
+        const granted = await acquire(PANEL_ID)
         if (disposed) {
-          void release(lease)
+          void release(granted?.lease)
           return true
+        }
+        const lease = granted?.lease
+        const partition = granted?.partition
+        // 租约不完整就别往下走：拿 undefined 当 partition 会挂出一个永远加载不出来的视图。
+        if (typeof lease !== 'string' || typeof partition !== 'string' || lease === '' || partition === '') {
+          setNote('桌面桥返回的租约不完整，退回内嵌框架')
+          return false
         }
         // 先挂 about:blank#<lease>：主进程的 will-attach-webview 只放行带合法 lease 的挂载。
         // partition 要在 src 之前设置——它必须在首次导航前就位，顺序反了会踩 Electron 的警告路径。
@@ -389,9 +397,36 @@ function MirrorStage({
         view.setAttribute('allowpopups', 'false')
         view.className = 'drd-frame'
         host.appendChild(view)
+
+        // 这条路唯一测不到（放行权在桌面主进程手里），所以三道兜底缺一不可：
+        // 租约不完整、加载失败、以及"什么都没发生"——都退到内嵌框架并写明原因，
+        // 不能让用户对着空白框发呆。
+        const fallback = (reason: string): void => {
+          if (disposed) return
+          disposeView?.()
+          disposeView = undefined
+          setMode('iframe')
+          setNote(reason)
+        }
+        watchdog = setTimeout(() => {
+          fallback('桌面原生视图 8 秒内没有就绪（可能是主进程拒绝了挂载：租约或 partition 不匹配）。已改用内嵌框架。')
+        }, 8_000)
         view.addEventListener('dom-ready', () => {
+          if (watchdog !== undefined) {
+            clearTimeout(watchdog)
+            watchdog = undefined
+          }
           if (!disposed) view.setAttribute('src', entryUrl)
         })
+        view.addEventListener('did-fail-load', (event: Event) => {
+          const detail = event as unknown as { errorCode?: number; errorDescription?: string; isMainFrame?: boolean }
+          if (detail.isMainFrame === false) return
+          // -3 = ERR_ABORTED：重定向或新导航顶掉旧导航时**正常**会触发。
+          // 镜像端点恰好是"带票据 → 302 落到 /"，把它当失败会自己把刚挂上的视图拆掉。
+          if (detail.errorCode === -3) return
+          fallback(`桌面原生视图加载失败（${detail.errorDescription ?? '未知原因'}）。已改用内嵌框架。`)
+        })
+
         disposeView = () => {
           try {
             view.remove()
@@ -418,6 +453,7 @@ function MirrorStage({
 
     return () => {
       disposed = true
+      if (watchdog !== undefined) clearTimeout(watchdog)
       disposeView?.()
     }
   }, [entryUrl, preference, services])
@@ -471,8 +507,17 @@ export function InstanceList({
   if (instances.length === 0) {
     return (
       <div className="drd-meta">
-        还没有配置实例。在 profile 的 <span className="drd-mono">cordis.patch.yml</span> 里给
-        <span className="drd-mono"> remote-desks </span>加上 <span className="drd-mono">instances</span> 即可。
+        <div>
+          还没有配置实例。在 profile 的 <span className="drd-mono">cordis.patch.yml</span> 里给
+          <span className="drd-mono"> remote-desks </span>加上 <span className="drd-mono">instances</span> 即可。
+        </div>
+        <div style={{ marginTop: 6 }}>
+          已经写了却还是空的？那多半是某个字段没通过校验——插件只拿得到校验后的配置，宿主日志里会有
+          <span className="drd-mono"> ValidationError: invalid config </span>
+          原文。常见坑：<span className="drd-mono">kind</span> 不是 local/wsl/ssh、
+          <span className="drd-mono">mirror.portRange</span> 不是两个数字、
+          <span className="drd-mono">openMode</span> 不在 auto/webview/iframe/browser/rightbar 里。
+        </div>
       </div>
     )
   }
