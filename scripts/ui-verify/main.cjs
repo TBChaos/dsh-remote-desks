@@ -131,13 +131,26 @@ async function main() {
     await wait(1200)
   }
 
+  // 安静轮询：只等，不记失败（实验性载体用）
+  const pollQuiet = async (code, timeoutMs) => {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      try {
+        if (await js(code)) return true
+      } catch {
+        /* 页面还在导航 */
+      }
+      await wait(400)
+    }
+    return false
+  }
+
   // 4. 面板（rightbar 载体下面板会立刻让位，所以判据放宽成"面板或镜像已出现"）
   const panelUp =
     expectStage === 'loose' || expectStage === 'gone'
-      ? await waitFor(
+      ? await pollQuiet(
           '!!document.querySelector(".drd-root") || !!document.querySelector(\'iframe[src*="127.0.0.1:196"]\')',
           25_000,
-          '面板或镜像出现',
         )
       : await waitFor('!!document.querySelector(".drd-root")', 20_000, '面板出现')
   if (panelUp && expectStage !== 'gone' && expectStage !== 'loose') {
