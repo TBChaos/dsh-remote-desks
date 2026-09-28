@@ -340,11 +340,12 @@ function MirrorStage({
           return true
         }
         // 先挂 about:blank#<lease>：主进程的 will-attach-webview 只放行带合法 lease 的挂载。
+        // partition 要在 src 之前设置——它必须在首次导航前就位，顺序反了会踩 Electron 的警告路径。
         const view = document.createElement('webview') as HTMLElement & {
           setAttribute(name: string, value: string): void
         }
-        view.setAttribute('src', `about:blank#${lease}`)
         view.setAttribute('partition', partition)
+        view.setAttribute('src', `about:blank#${lease}`)
         view.setAttribute('allowpopups', 'false')
         view.className = 'drd-frame'
         host.appendChild(view)

@@ -289,6 +289,19 @@ check('容器链含 iframe 兜底', source.includes('iframe'))
 check('容器链含系统浏览器兜底', source.includes('_blank'))
 check('容器链含官方右栏载体', source.includes('openTab') && source.includes('openRightbar'))
 check('容器偏好读取配置', source.includes('openMode'))
+// partition 必须在 src 之前设置：它得在首次导航前就位。
+const attrAt = (name) => {
+  const single = source.indexOf(`'${name}'`)
+  const double = source.indexOf(`"${name}"`)
+  if (single === -1) return double
+  if (double === -1) return single
+  return Math.min(single, double)
+}
+check(
+  'webview 先设 partition 再设 src',
+  attrAt('partition') !== -1 && attrAt('src') !== -1 && attrAt('partition') < attrAt('src'),
+  `partition@${String(attrAt('partition'))} src@${String(attrAt('src'))}`,
+)
 check('面板引用了生命周期动作', source.includes('restart') && source.includes('start') && source.includes('stop'))
 check('面板有预检入口', source.includes('/check'))
 
