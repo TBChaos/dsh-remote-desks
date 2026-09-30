@@ -1,0 +1,37 @@
+# 推上去就跑一遍：类型检查 → 构建（host + 客户端 bundle）→ 冒烟测试。
+#
+# 只跑 Windows：这个插件的目标运行形态是 Windows 桌面版 DSH（WSL / Electron 都在那条路上），
+# 冒烟那 288 项也是在 Windows 上长出来的。活体验证（`pnpm verify:live`）需要真实 WSL / SSH，
+# 不放进 CI；浏览器验证（`pnpm verify:ui`）需要 Electron 图形环境，同样是本地跑。
+name: verify
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 类型检查（host + 客户端两套 tsconfig）
+        run: pnpm typecheck
+
+      - name: 构建 + 冒烟测试
+        run: pnpm verify
