@@ -1,12 +1,15 @@
 # dsh-remote-desks · 远端工作台
 
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![verify](https://github.com/TBChaos/dsh-remote-desks/actions/workflows/verify.yml/badge.svg)](https://github.com/TBChaos/dsh-remote-desks/actions/workflows/verify.yml)
+
 把**本机 / WSL / 虚拟机 / SSH 远端**上另一套 DSH 的 WebUI **镜像进桌面版 DSH**，用**同一套界面和体验**
-管理它们：点一下窗口角上的下拉框，主区就换成那台机器的那套 DSH；启动、停止、更新也都在这里。
+管理它们：点一下窗口上边的下拉框，主区就换成那台机器的那套 DSH；启动、停止、更新也都在这里。
 
 镜像出来的界面就是 DSH 自己的前端（随远端版本走），桌面窗口的外壳、主题、侧栏与快捷键
 全部复用当前应用，不另造一套 UI。
 
-> **状态：M0–M6 完成。** 本机、WSL、SSH（含虚拟机 / 远程主机）三种实例都能并发启动、镜像、停止；
+> **状态：M0–M8 完成。** 本机、WSL、SSH（含虚拟机 / 远程主机）三种实例都能并发启动、镜像、停止；
 > 面板、设置页、日志抽屉、预检、容器降级链都已接好，并且**在真实浏览器里驱动界面验证过**
 > （见下方截图与 `pnpm verify:ui`）。M5 起本机那一项**默认吸附桌面应用自己那套 DSH**
 > （打开应用就是「运行中」，不另起进程）；M6 起默认是**统一界面**——选中那台机器的 DSH 界面
@@ -714,4 +717,7 @@ cordis.patch.yml        bundle patch（安装时并入 profile）
 
 ## 许可
 
-MIT，见 [LICENSE](LICENSE)。
+[MIT](LICENSE) © 2026 TBChaos
+
+欢迎提 issue / PR。改动前建议跑一遍 `pnpm verify`（类型检查 + 构建 + 288 项冒烟）；
+碰了实例生命周期或镜像代理就再跑 `pnpm verify:live`，碰了界面就再跑 `pnpm verify:ui`。
