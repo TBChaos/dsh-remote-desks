@@ -38,10 +38,14 @@
 ```bash
 # 1) 装插件（本地目录 / npm 包 / git 地址都行）
 dsh plugin --profile desktop add D:\code\dsh-remote-desks
+#    直接从仓库装：dsh plugin --profile desktop add github:TBChaos/dsh-remote-desks
 #    或者用桌面版设置里的 Plugins 页安装
 
 # 2) 完整重启桌面应用
 ```
+
+> 源码在 **[github.com/TBChaos/dsh-remote-desks](https://github.com/TBChaos/dsh-remote-desks)**（MIT）。
+> 想改代码：`pnpm install` → `pnpm verify`（类型检查 + 构建 + 288 项冒烟）。
 
 > **改完必须完整重启，刷新窗口不够。** 这一条是实测出来的（`node scripts/probe-client-reload.mjs`）：
 > 宿主在**启动时**就把各插件的客户端 bundle读进内存了（bundle 地址带 `?rev=<内容哈希>`，
