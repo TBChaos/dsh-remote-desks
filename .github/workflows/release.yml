@@ -1,0 +1,31 @@
+# 打标签就发一个 Release（说明由提交记录自动生成）。
+#
+#   git tag -a v0.1.0 -m "0.1.0" && git push origin v0.1.0
+#
+# 只做 GitHub Release，不发 npm：这个插件的主要安装方式是 `dsh plugin add <本地目录 / git 地址>`，
+# 真要从 npm 发布的话，再加一个带 NPM_TOKEN 的 job 即可。
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 建 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag

@@ -44,7 +44,8 @@ dsh plugin --profile desktop add D:\code\dsh-remote-desks
 # 2) 完整重启桌面应用
 ```
 
-> 源码在 **[github.com/TBChaos/dsh-remote-desks](https://github.com/TBChaos/dsh-remote-desks)**（MIT）。
+> 源码在 **[github.com/TBChaos/dsh-remote-desks](https://github.com/TBChaos/dsh-remote-desks)**（MIT），
+> 版本改动见 [CHANGELOG.md](CHANGELOG.md)。
 > 想改代码：`pnpm install` → `pnpm verify`（类型检查 + 构建 + 288 项冒烟）。
 
 > **改完必须完整重启，刷新窗口不够。** 这一条是实测出来的（`node scripts/probe-client-reload.mjs`）：
@@ -722,6 +723,9 @@ cordis.patch.yml        bundle patch（安装时并入 profile）
 ## 许可
 
 [MIT](LICENSE) © 2026 TBChaos
+
+版本改动记在 [CHANGELOG.md](CHANGELOG.md)；打 `v*` 标签会由 `.github/workflows/release.yml`
+自动建一个 GitHub Release。
 
 欢迎提 issue / PR。改动前建议跑一遍 `pnpm verify`（类型检查 + 构建 + 288 项冒烟）；
 碰了实例生命周期或镜像代理就再跑 `pnpm verify:live`，碰了界面就再跑 `pnpm verify:ui`。

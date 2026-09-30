@@ -1,7 +1,6 @@
 {
   "name": "dsh-remote-desks",
   "version": "0.1.0",
-  "private": true,
   "description": "把本机 / WSL / 远端 DSH 的 WebUI 镜像进桌面版 DSH，并在同一界面里启动、停止这些实例。",
   "keywords": [
     "deepseek-harness",
