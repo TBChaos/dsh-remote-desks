@@ -3,6 +3,7 @@ import {
   createServer,
   request as httpRequest,
   type IncomingMessage,
+  type OutgoingHttpHeaders,
   type Server,
   type ServerResponse,
 } from 'node:http'
@@ -51,6 +52,9 @@ export class MirrorEndpoint {
   private readonly options: MirrorEndpointOptions
   private readonly ticket = randomBytes(24).toString('base64url')
   private readonly sockets = new Set<Duplex>()
+  /** 内容寻址的前端资源内存缓存：`${method} ${url}` → 响应体与头。 */
+  private readonly cache = new Map<string, { buffer: Buffer; headers: Record<string, string | string[]>; bytes: number }>()
+  private cacheBytes = 0
   private server: Server | undefined
   private info: MirrorEndpointInfo | undefined
 
@@ -64,6 +68,16 @@ export class MirrorEndpoint {
 
   get baseUrl(): string | undefined {
     return this.info?.baseUrl
+  }
+
+  /** 票据（预热要用它自己走一遍镜像，等于把远端那套前端先拉进缓存）。 */
+  get ticketValue(): string {
+    return this.ticket
+  }
+
+  /** 缓存里现在有多少字节（诊断用）。 */
+  get cachedBytes(): number {
+    return this.cacheBytes
   }
 
   async start(): Promise<MirrorEndpointInfo> {
@@ -150,7 +164,7 @@ export class MirrorEndpoint {
       url.searchParams.delete('k')
       const rest = url.searchParams.toString()
       res.statusCode = 302
-      res.setHeader('set-cookie', `${TICKET_COOKIE}=${this.ticket}; Path=/; HttpOnly; SameSite=Lax`)
+      res.setHeader('set-cookie', ticketCookie(this.ticket, isCrossSite(req)))
       res.setHeader('location', `${url.pathname}${rest === '' ? '' : `?${rest}`}`)
       res.end()
       return
@@ -167,6 +181,19 @@ export class MirrorEndpoint {
   /* ── HTTP 转发 ── */
 
   private async forward(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const method = req.method ?? 'GET'
+    const key = `${method} ${req.url ?? '/'}`
+    // 命中缓存就直接回，不再去上游要一遍——远端那套前端是几 MB 的按需组合 bundle，
+    // 第一次请求它还要现拼（`buildComboScript`），这是"切过去要等半天"的主要成本。
+    const cached = this.cache.get(key)
+    if (cached !== undefined && cached.buffer.length <= cached.bytes) {
+      res.statusCode = 200
+      for (const [name, value] of Object.entries(cached.headers)) res.setHeader(name, value)
+      res.setHeader('x-drd-cache', 'hit')
+      res.end(cached.buffer)
+      return
+    }
+
     const abort = new AbortController()
     res.on('close', () => abort.abort())
     const authority = `127.0.0.1:${String(this.options.remotePort)}`
@@ -187,7 +214,7 @@ export class MirrorEndpoint {
     const upstream = httpRequest({
       createConnection: () => socket,
       setHost: false,
-      method: req.method,
+      method,
       path: req.url,
       headers,
     })
@@ -195,13 +222,36 @@ export class MirrorEndpoint {
     upstream.on('response', (upstreamRes) => {
       res.statusCode = upstreamRes.statusCode ?? 502
       const rewritten = rewriteResponseHeaders(upstreamRes.headers)
-      for (const [name, value] of Object.entries(rewritten)) {
-        if (value !== undefined) res.setHeader(name, value)
+      const storable = cacheableResponse(method, req.url ?? '/', upstreamRes.statusCode ?? 0, rewritten)
+      if (storable === undefined) {
+        for (const [name, value] of Object.entries(rewritten)) {
+          if (value !== undefined) res.setHeader(name, value)
+        }
+        upstreamRes.pipe(res)
+        return
       }
-      upstreamRes.pipe(res)
+      // 能缓存的（内容寻址的前端资源）先攒齐再发：既给浏览器，也给自己留一份。
+      const chunks: Buffer[] = []
+      let total = 0
+      upstreamRes.on('data', (chunk: Buffer) => {
+        total += chunk.length
+        if (total <= MAX_CACHE_ENTRY_BYTES) chunks.push(chunk)
+      })
+      upstreamRes.on('end', () => {
+        if (total <= MAX_CACHE_ENTRY_BYTES && !res.headersSent) {
+          this.remember(key, Buffer.concat(chunks), rewritten)
+        }
+        for (const [name, value] of Object.entries(rewritten)) {
+          if (value !== undefined) res.setHeader(name, value)
+        }
+        res.end(Buffer.concat(chunks))
+      })
+      upstreamRes.on('error', () => {
+        if (!res.headersSent) res.destroy()
+      })
     })
     upstream.on('error', (error) => {
-      const detail = `上游请求失败 ${req.method ?? 'GET'} ${req.url ?? '/'}：${describeError(error)}`
+      const detail = `上游请求失败 ${method} ${req.url ?? '/'}：${describeError(error)}`
       this.log(detail)
       if (res.headersSent) {
         res.destroy()
@@ -211,6 +261,27 @@ export class MirrorEndpoint {
     })
     res.on('close', () => upstream.destroy())
     req.pipe(upstream)
+  }
+
+  /* ── 资源缓存（内容寻址的前端资源） ── */
+
+  private remember(key: string, buffer: Buffer, headers: OutgoingHttpHeaders): void {
+    if (buffer.length > MAX_CACHE_ENTRY_BYTES) return
+    if (this.cacheBytes + buffer.length > MAX_CACHE_BYTES) {
+      // 简单 LRU：超预算就把最早进来的那批丢掉（前端资源是内容寻址的，丢了只是下次再取一遍）。
+      for (const [oldKey, entry] of this.cache) {
+        if (this.cacheBytes + buffer.length <= MAX_CACHE_BYTES) break
+        this.cache.delete(oldKey)
+        this.cacheBytes -= entry.buffer.length
+      }
+    }
+    if (this.cacheBytes + buffer.length > MAX_CACHE_BYTES) return
+    const kept: Record<string, string | string[]> = {}
+    for (const [name, value] of Object.entries(headers)) {
+      if (value !== undefined && name.toLowerCase() !== 'set-cookie') kept[name] = value as string | string[]
+    }
+    this.cache.set(key, { buffer, headers: kept, bytes: buffer.length })
+    this.cacheBytes += buffer.length
   }
 
   /* ── WebSocket / 升级转发 ── */
@@ -263,6 +334,71 @@ function describeError(error: unknown): string {
     return code === undefined ? error.message : `${code} ${error.message}`
   }
   return String(error)
+}
+
+/**
+ * 这次请求是不是"跨站"来的。
+ *
+ * 桌面版里这一条决定成败：顶层文档是 `dsh-app://app`（不是 http 源），所以嵌进去的镜像
+ * **是第三方 iframe**——而 `SameSite=Lax` 的 cookie 在第三方 iframe 里根本不会被带上，
+ * 表现就是镜像里显示"需要票据"（实测：纯 Web 外壳里正常，桌面版里就 403）。
+ */
+export function isCrossSite(req: IncomingMessage): boolean {
+  const site = req.headers['sec-fetch-site']
+  const value = Array.isArray(site) ? site[0] : site
+  // 没有这个头（老客户端/非浏览器）时按最保守的跨站处理。
+  if (value === undefined || value === '') return true
+  return value === 'cross-site'
+}
+
+/**
+ * 票据 cookie。
+ *
+ * 跨站时必须是 `SameSite=None; Secure` 才会被带上；`Secure` 在 `http://127.0.0.1`
+ * 上是被允许的（Chromium 把回环当可信来源）。同站时仍旧用 `Lax`，少给一点权限。
+ */
+export function ticketCookie(ticket: string, crossSite: boolean): string {
+  const sameSite = crossSite ? 'None; Secure' : 'Lax'
+  return `${TICKET_COOKIE}=${ticket}; Path=/; HttpOnly; SameSite=${sameSite}`
+}
+
+/** 单个缓存条目的上限（一个 combo bundle 见过 1 MB 出头）。 */
+const MAX_CACHE_ENTRY_BYTES = 8 * 1024 * 1024
+/** 整个端点的缓存预算：装得下那套前端（实测几 MB），又不至于把内存吃穿（每实例一份）。 */
+const MAX_CACHE_BYTES = 32 * 1024 * 1024
+
+/**
+ * 这个响应值不值得进内存缓存。
+ *
+ * 判据是"内容寻址"：URL 里带 `rev=<哈希>`（DSH 的插件 bundle 就是这么发的），
+ * 或者 dist 里的 `assets/*-<哈希>.js`。这类东西内容变了 URL 就变，永远不会返回陈旧内容。
+ * 其它一律不缓存——尤其是带 cookie 的 `/api/*`。
+ */
+export function cacheableResponse(
+  method: string,
+  url: string,
+  status: number,
+  headers: OutgoingHttpHeaders,
+): { kind: 'bundle' } | undefined {
+  if (method !== 'GET' || status !== 200) return undefined
+  // 带 `content-encoding` 的一律不缓存：Node 的 fetch（预热用的那个）会自动解压，
+  // 而浏览器请求带的是 `accept-encoding: gzip`——两种字节混在同一个 key 下，
+  // 迟早会把"解压后的字节 + gzip 头"发给浏览器（实测在活体验证里翻过一次车）。
+  if (headers['content-encoding'] !== undefined) return undefined
+  const contentType = String(headers['content-type'] ?? '')
+  if (!/javascript|text\/css|font|image\/svg|application\/json/.test(contentType)) return undefined
+  // 注意别用 `url.split('?')`：DSH 的 combo URL 本身就是 `/plugins/??a,b&rev=…`（两个问号），
+  // 那样切出来的 query 是空的，rev 判据就永远不成立（实测踩过）。
+  const mark = url.indexOf('?')
+  const pathname = mark === -1 ? url : url.slice(0, mark)
+  const query = mark === -1 ? '' : url.slice(mark + 1)
+  if (pathname.startsWith('/api/')) return undefined
+  const hashed = /[?&]rev=[\w.-]+/.test(query) || /-[A-Za-z0-9_-]{8,}\.(js|css|woff2?|svg)$/.test(pathname)
+  if (!hashed) return undefined
+  if (pathname.startsWith('/plugins/') || pathname.startsWith('/assets/') || pathname.startsWith('/chunks/')) {
+    return { kind: 'bundle' }
+  }
+  return undefined
 }
 
 function failHtml(res: ServerResponse, status: number, title: string, detail: string): void {

@@ -50,7 +50,7 @@ export function asSocket(stream: Duplex): Duplex {
  * 因此 HTTP / WebSocket / SSE 的转发逻辑只有一份。
  */
 export interface UpstreamConnector {
-  readonly kind: 'local' | 'wsl-relay' | 'ssh-forward'
+  readonly kind: 'local' | 'host-self' | 'wsl-relay' | 'ssh-forward'
   /** 给日志和排障用的一句话描述。 */
   describe(): string
   connect(signal?: AbortSignal): Promise<Duplex>

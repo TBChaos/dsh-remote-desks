@@ -50,11 +50,23 @@ export interface CapabilityReport {
     dshHome: string | null
     dshProfile: string | null
     clientVersion: string | null
+    /** 宿主自己的 web 端口（本机实例吸附的就是它）；拿不到是 null。 */
+    webPort: number | null
+    /** 能不能用宿主自己的令牌换会话（换不到就没法吸附）。 */
+    selfAttachable: boolean
   }
   services: Record<string, boolean>
   runtime: DshRuntimeProbe
   control: { prefix: string; gate: string }
-  config: { instances: number; enabledInstances: number; autoStart: number; openMode: string }
+  config: {
+    instances: number
+    enabledInstances: number
+    autoStart: number
+    openMode: string
+    /** 显式写了 attach: true 的实例数。 */
+    attachInstances: number
+    switcher: string
+  }
 }
 
 function readVersion(packageJson: string): string | undefined {
@@ -181,6 +193,10 @@ export interface CapabilityProbeInput {
   gate: () => string
   has(key: string): boolean
   config: RemoteDesksConfig
+  /** 宿主自己的 web 端口；拿不到返回 undefined。 */
+  webPort?: () => number | undefined
+  /** 宿主是否能提供进程令牌（决定能不能吸附）。 */
+  selfAttachable?: () => boolean
 }
 
 export function buildCapabilityReport(input: CapabilityProbeInput): CapabilityReport {
@@ -206,6 +222,8 @@ export function buildCapabilityReport(input: CapabilityProbeInput): CapabilityRe
       dshHome: process.env.DSH_HOME ?? null,
       dshProfile: process.env.DSH_PROFILE ?? null,
       clientVersion: process.env.DSH_CLIENT_VERSION ?? null,
+      webPort: input.webPort?.() ?? null,
+      selfAttachable: input.selfAttachable?.() ?? false,
     },
     services,
     runtime: probeDshRuntime(),
@@ -215,6 +233,8 @@ export function buildCapabilityReport(input: CapabilityProbeInput): CapabilityRe
       enabledInstances: enabled.length,
       autoStart: input.config.autoStart.length,
       openMode: input.config.mirror.openMode,
+      attachInstances: input.config.instances.filter((instance) => instance.attach === true).length,
+      switcher: input.config.switcher.enabled ? input.config.switcher.corner : 'off',
     },
   }
 }

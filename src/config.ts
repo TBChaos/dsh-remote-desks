@@ -46,6 +46,17 @@ export interface RemoteDeskInstance {
   jumpHosts: RemoteDeskJumpHost[]
   /** 已知主机密钥指纹（SHA256 base64）；留空则接受并打印指纹（TOFU）。 */
   hostKeyFingerprint?: string
+  /**
+   * 吸附到**已经在跑**的那套 DSH，而不是自己拉起一个进程。
+   *
+   * - `true`：显式吸附宿主自身的 web 服务（任何宿主形态都可以）；
+   * - `false`：永远自己拉起进程；
+   * - 留空（默认）：自动——当宿主就是桌面版内置运行时（`app.asar` 里那份）且本实例没有
+   *   指定别的入口时吸附。这正是"打开桌面软件，本机那一项本来就该是运行中"的场景。
+   *
+   * 吸附时 `profile` / `cwd` / `entry` 都不参与启动（压根没有新进程），镜像的就是宿主自己。
+   */
+  attach?: boolean
   /** 覆盖启动命令（留空则按 kind 推导）。 */
   launchCommand?: string
   /** 覆盖更新命令（更新功能尚未启用，先保留字段）。 */
@@ -55,6 +66,43 @@ export interface RemoteDeskInstance {
 }
 
 export type MirrorOpenMode = 'auto' | 'webview' | 'rightbar' | 'iframe' | 'browser'
+
+/**
+ * 窗口里那个机器切换下拉框的位置。
+ *
+ * 默认**上边中间**：右上角会压到官方那颗侧栏开关（以及面板自己的按钮），左上角是窗口菜单。
+ */
+export type SwitcherCorner = 'top-center' | 'top-right' | 'top-left'
+
+export interface RemoteDesksSwitcherConfig {
+  /** 是否显示切换下拉框。 */
+  enabled: boolean
+  /** 贴上边哪个位置。 */
+  corner: SwitcherCorner
+  /** 距边缘的水平像素（顶部居中时用不上）。默认 56。 */
+  offsetX: number
+  /**
+   * 距顶部的像素。**留空**时跟随官方 token `--dsh-frame-overlay-top`
+   * （桌面版 = 标题栏高度 + 20px，全屏时 20px），也就是官方给帧级浮层准备的那条基线。
+   */
+  offsetY?: number
+}
+
+/** 面板的两种形态：统一界面（镜像铺满）与管理界面（列表 + 工具栏 + 日志）。 */
+export type WorkbenchLayoutMode = 'immersive' | 'manage'
+
+export interface RemoteDesksLayoutConfig {
+  /**
+   * 默认形态。
+   *
+   * `immersive`（默认）= 选中的那台机器的 DSH 界面铺满主区，我们自己的列表 / 工具栏 / 日志都收起来，
+   * 只留一条很轻的浮条——目的是"和 WebUI 一样的界面和体验，只是换成另一台机器在跑"。
+   * `manage` = 现在这种管理视图。运行时随时可以互相切换（按钮就在面板上，选择记在本地）。
+   */
+  mode: WorkbenchLayoutMode
+  /** 进入统一界面时顺带把官方侧栏收成窄条，让远端 UI 拿到整扇窗（默认否）。 */
+  collapseSidebar: boolean
+}
 
 export interface RemoteDesksConfig {
   instances: RemoteDeskInstance[]
@@ -67,6 +115,10 @@ export interface RemoteDesksConfig {
     portRange: number[]
     openMode: MirrorOpenMode
   }
+  /** 全局切换下拉框（窗口角上的「本机 / WSL」）。 */
+  switcher: RemoteDesksSwitcherConfig
+  /** 面板形态（统一界面 / 管理界面）。 */
+  layout: RemoteDesksLayoutConfig
   /** 是否把就绪信息写进 host 日志。 */
   announce: boolean
 }
@@ -116,9 +168,27 @@ const Instance = Schema.object({
   jumpHosts: Schema.array(JumpHost).default([]),
   hostKeyFingerprint: Schema.string(),
 
+  attach: Schema.boolean(),
   launchCommand: Schema.string(),
   updateCommand: Schema.string(),
   readyTimeoutMs: Schema.natural(),
+})
+
+const Switcher = Schema.object({
+  enabled: Schema.boolean().default(true),
+  corner: Schema.union([
+    Schema.const('top-center'),
+    Schema.const('top-right'),
+    Schema.const('top-left'),
+  ]).default('top-center'),
+  offsetX: Schema.natural().default(56),
+  // 不设默认值：留空 = 跟随官方 `--dsh-frame-overlay-top`。
+  offsetY: Schema.natural(),
+})
+
+const Layout = Schema.object({
+  mode: Schema.union([Schema.const('immersive'), Schema.const('manage')]).default('immersive'),
+  collapseSidebar: Schema.boolean().default(false),
 })
 
 export const Config: Schema<RemoteDesksConfig> = Schema.object({
@@ -136,5 +206,7 @@ export const Config: Schema<RemoteDesksConfig> = Schema.object({
       Schema.const('browser'),
     ]).default('auto'),
   }).default({ host: '127.0.0.1', portRange: [0, 0], openMode: 'auto' }),
+  switcher: Switcher.default({ enabled: true, corner: 'top-center', offsetX: 56 }),
+  layout: Layout.default({ mode: 'immersive', collapseSidebar: false }),
   announce: Schema.boolean().default(true),
 })

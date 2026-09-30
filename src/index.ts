@@ -7,7 +7,7 @@ import { buildCapabilityReport, probeDshRuntime, type CapabilityReport } from '.
 import { Config, type RemoteDesksConfig } from './config.js'
 import { createControlHandler, loopbackOriginGuard, type ControlApi } from './control/routes.js'
 import { InstanceSupervisor } from './instances/supervisor.js'
-import type { InstanceSnapshot, LocalRuntime } from './instances/types.js'
+import type { HostSelfEndpoint, InstanceSnapshot, LocalRuntime } from './instances/types.js'
 
 /** 插件包名，同时也是客户端 bundle 的模块 id。 */
 export const name = 'dsh-remote-desks'
@@ -16,7 +16,7 @@ export const inject = ['webServer']
 /** 展示名（中文优先）。 */
 export const displayName = '远端工作台'
 /** 当前里程碑，会出现在面板与状态接口里。 */
-export const milestone = 'M4 · 多实例并发 / 五种容器 / 更新与回滚'
+export const milestone = 'M5 · 本机吸附（打开即运行中）/ 窗口切换 / 镜像容器稳定'
 /** 控制接口挂载前缀。 */
 export const CONTROL_PREFIX = '/remote-desks'
 
@@ -47,6 +47,13 @@ interface WebServerLike {
 
 interface ConnectionLike {
   requestRejection?: (request: unknown) => number | undefined
+  /** 给一个普通 web 应用地址加上本进程的令牌（首次登录用）。 */
+  authenticatedUrl?: (baseUrl: string) => string
+}
+
+interface WebServerLikeWithPort extends WebServerLike {
+  /** 真正监听上的端口（监听前是 0）。 */
+  port?: number
 }
 
 interface LoggerLike {
@@ -103,10 +110,46 @@ function createGuard(ctx: RemoteDesksHostContext): {
 }
 
 /**
+ * 探测「宿主自身」那套 DSH 的端点。
+ *
+ * 桌面应用打开时，本机那套 DSH 已经在 `127.0.0.1:19387` 上跑着了（就是宿主自己），
+ * 所以本机实例的正确行为是**吸附**而不是再拉一份：端口从 `webServer.port` 拿，
+ * 会话 cookie 用 `connection.authenticatedUrl()` 加的进程令牌换——桌面壳启动时走的也是这条路。
+ *
+ * 两个都拿不到时返回 undefined（老宿主），调用方会明说"无法吸附"而不是假装成功。
+ */
+function probeHostSelf(ctx: RemoteDesksHostContext): HostSelfEndpoint | undefined {
+  const server = ctx.get('webServer') as WebServerLikeWithPort | undefined
+  const port = typeof server?.port === 'number' && Number.isSafeInteger(server.port) && server.port > 0
+    ? server.port
+    : undefined
+  if (port === undefined) return undefined
+  const base = `http://127.0.0.1:${String(port)}/`
+  const connection = ctx.get('connection') as ConnectionLike | undefined
+  let authenticatedUrl = base
+  if (typeof connection?.authenticatedUrl === 'function') {
+    try {
+      authenticatedUrl = connection.authenticatedUrl(base)
+    } catch (error) {
+      ctx.logger?.warn?.('[dsh-remote-desks] connection.authenticatedUrl 抛错，改用裸地址：', error)
+    }
+  }
+  return {
+    port,
+    authenticatedUrl,
+    // 裸地址换不到 cookie（会 401），所以这里如实说明"令牌到位了没有"，
+    // 由监管器决定是等一等还是直接吸附。
+    tokenized: authenticatedUrl.includes('token='),
+    describe: `宿主自身（127.0.0.1:${String(port)}）`,
+  }
+}
+
+/**
  * 插件入口。
  *
  * 装配三件事：宿主能力探测、控制接口（挂在本地 web server 上）、实例监管器。
- * 空配置下不启动任何进程；只有 config.instances 里声明且被 start 的实例才会跑起来。
+ * 空配置下不启动任何进程；只有 config.instances 里声明且被 start 的实例才会跑起来——
+ * 唯一的例外是「吸附」：本机实例指向的就是宿主自己那套在跑的 DSH，启动时直接接上。
  */
 export function apply(ctx: RemoteDesksHostContext, config: RemoteDesksConfig): void {
   const { guard, describeGate } = createGuard(ctx)
@@ -121,20 +164,31 @@ export function apply(ctx: RemoteDesksHostContext, config: RemoteDesksConfig): v
       gate: describeGate,
       has: (key) => ctx.get(key) !== undefined,
       config,
+      webPort: () => probeHostSelf(ctx)?.port,
+      selfAttachable: () => probeHostSelf(ctx) !== undefined,
     })
 
   const dshHome = process.env.DSH_HOME ?? join(homedir(), '.dsh')
   const subprocess = (): ReturnType<typeof asSubprocess> => asSubprocess(ctx.get('subprocess'))
 
   const supervisor = new InstanceSupervisor(
-    { instances: config.instances, mirror: { host: config.mirror.host, portRange: config.mirror.portRange } },
+    {
+      instances: config.instances,
+      mirror: { host: config.mirror.host, portRange: config.mirror.portRange },
+    },
     {
       dshHome,
       localRuntime: (): LocalRuntime | undefined => {
         const runtime = probeDshRuntime()
         if (!runtime.found || runtime.entry === undefined) return undefined
-        return { entry: runtime.entry, execPath: process.execPath, electron: process.versions.electron !== undefined }
+        return {
+          entry: runtime.entry,
+          execPath: process.execPath,
+          electron: process.versions.electron !== undefined,
+          inAsar: runtime.inAsar === true,
+        }
       },
+      hostSelf: () => probeHostSelf(ctx),
       resolveCredential: async (name): Promise<string | undefined> => {
         const credentials = ctx.get('credentials') as
           | { resolve(ref: string): Promise<{ value: string } | undefined> }
@@ -200,6 +254,23 @@ export function apply(ctx: RemoteDesksHostContext, config: RemoteDesksConfig): v
       }
     })()
   }
+
+  // 吸附：本机那一项指向的就是宿主自己那套 DSH，它本来就在跑——启动时直接接上，
+  // 免得用户在面板里看到一个"未启动"的本机实例（而它明明正在给他显示这个界面）。
+  void (async () => {
+    try {
+      const attached = await supervisor.autoAttach()
+      if (attached.length > 0) {
+        ctx.logger?.info?.(
+          `[${name}] 已吸附宿主自身：${attached.join(', ')}｜镜像控制接口 ${CONTROL_PREFIX}/api/instances`,
+        )
+      }
+    } catch (error) {
+      ctx.logger?.warn?.(
+        `[${name}] 自动吸附失败：${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  })()
 }
 
 /** 从 ctx.get('subprocess') 取出可用的子进程服务；形状不对就当作没有。 */

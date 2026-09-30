@@ -4,17 +4,20 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { MirrorEndpoint } from '../mirror/endpoint.js'
+import { TICKET_COOKIE } from '../mirror/rewrite.js'
 import { asSocket, sshUpstream, tcpUpstream, type UpstreamConnector } from '../mirror/upstream.js'
 import type { RemoteDeskInstance } from '../config.js'
 import { SshConnection } from '../ssh/manager.js'
 import { sshProcessHandle } from '../ssh/process.js'
-import { exchangeSession, findReadyUrl } from './readiness.js'
+import { decideAttach } from './attach.js'
+import { exchangeSession, findReadyUrl, type SessionExchange } from './readiness.js'
 import { preflight, type PreflightCheck } from './preflight.js'
 import { POSIX_SHELL_PREFIX, planFor, wslShellArgv } from './spec.js'
 import { parseVersion, resolveUpdatePlan, type VersionProbe } from './update.js'
 import {
   instanceById,
   labelOf,
+  type HostSelfEndpoint,
   type InstanceConfigSource,
   type InstancePhase,
   type InstanceSnapshot,
@@ -53,6 +56,15 @@ const MAX_LOG_LINES = 600
 const READY_TIMEOUT_MS = 90_000
 const POLL_INTERVAL_MS = 200
 const PROBE_TIMEOUT_MS = 4_000
+/** 吸附时等宿主能力（端口 + 进程令牌）就位的上限。 */
+const ATTACH_READY_TIMEOUT_MS = 20_000
+/** 吸附时的轮询间隔，以及会话换取的退避基数。 */
+const ATTACH_POLL_MS = 400
+/** 会话换取最多试几次（启动早期 `/` 还没被前端兜底认领时会 404）。 */
+const ATTACH_EXCHANGE_ATTEMPTS = 8
+/** 镜像预热的总预算与并发（纯尽力而为，超时就到此为止）。 */
+const WARMUP_TIMEOUT_MS = 60_000
+const WARMUP_CONCURRENCY = 3
 /** 版本探测超时：远端要 source nvm，给宽一点。 */
 const VERSION_TIMEOUT_MS = 30_000
 /** 更新/回滚超时：包管理器可能拉很久。 */
@@ -90,6 +102,15 @@ interface Runtime {
   readyFromGlobal: number
   poll?: NodeJS.Timeout
   busy: boolean
+  /** 这一轮是「吸附」宿主自身（没有子进程句柄），而不是拉起进程。 */
+  attached?: boolean
+  /**
+   * 上一次镜像端点用的端口。
+   *
+   * 复用同一个端口 = 复用同一个 origin：浏览器缓存（那几百 KB 前端 bundle）与镜像里那套 DSH
+   * 自己的 localStorage（界面偏好、上次看的会话）都留得住，切回来不用重新渲染一遍。
+   */
+  lastMirrorPort?: number
   /** 已知的 DSH 版本，以及最近一次更新/回滚。 */
   version?: string
   lastUpdate?: UpdateRecord
@@ -142,6 +163,7 @@ export class InstanceSupervisor {
       ...(runtime.upstreamDescription === undefined ? {} : { upstream: runtime.upstreamDescription }),
       ...(runtime.error === undefined ? {} : { error: runtime.error }),
       ...(runtime.exit === undefined ? {} : { exit: runtime.exit }),
+      ...(runtime.attached === true ? { attached: true } : {}),
       ...(runtime.version === undefined ? {} : { version: runtime.version }),
       ...(runtime.lastUpdate === undefined ? {} : { lastUpdate: runtime.lastUpdate }),
       logs: { nextOffset: runtime.base + runtime.lines.length, lines: runtime.lines },
@@ -160,11 +182,32 @@ export class InstanceSupervisor {
     const instance = instanceById(this.config, id)
     if (instance === undefined) throw new Error(`没有这个实例：${id}`)
     const runtime = this.runtimeOf(id)
-    const checks = await preflight(instance, {
-      localRuntime: this.deps.localRuntime,
-      dshHome: this.deps.dshHome,
-      resolveCredential: this.deps.resolveCredential,
-    })
+    const hostSelf = this.deps.hostSelf()
+    const decision = decideAttach(instance, hostSelf, this.deps.localRuntime())
+
+    // 吸附的实例不启动任何进程，profile / cwd / 入口那一套检查对它没有意义——只回答吸附本身。
+    const checks: PreflightCheck[] = decision.attach
+      ? [
+          {
+            name: '吸附宿主自身',
+            ok: true,
+            detail: `${decision.reason}｜镜像上游 http://127.0.0.1:${String(hostSelf?.port ?? 0)}`,
+          },
+          {
+            name: '启动方式',
+            ok: true,
+            detail: '不启动新进程：镜像的就是宿主自己那套 DSH（profile / cwd / entry 都不参与）',
+          },
+        ]
+      : await preflight(instance, {
+          localRuntime: this.deps.localRuntime,
+          dshHome: this.deps.dshHome,
+          resolveCredential: this.deps.resolveCredential,
+        })
+    // 显式写了 attach: true 却吸附不了时要说出来，不能悄悄退回"自己拉一份"。
+    if (!decision.attach && instance.kind === 'local' && instance.attach === true) {
+      checks.unshift({ name: '吸附宿主自身', ok: false, detail: decision.reason })
+    }
     // 顺带把版本探一下：面板因此能在启动前就显示"目标机上装的是哪一版"。
     const probe = await this.probeVersion(instance, runtime)
     if (probe.ok && probe.version !== undefined) runtime.version = probe.version
@@ -219,6 +262,9 @@ export class InstanceSupervisor {
     if (runtime.busy) throw new Error(`实例 ${id} 正在处理上一个操作`)
     if (runtime.phase !== 'stopped') {
       throw new Error(`实例 ${id} 当前是「${runtime.phase}」，请先停止再${kind === 'update' ? '更新' : '回滚'}`)
+    }
+    if (runtime.attached === true) {
+      throw new Error('这个实例吸附的是宿主自身（桌面版内置运行时），它的版本跟着桌面应用走，不能用 npm 更新')
     }
 
     const plan = resolveUpdatePlan(instance, this.localEntry(instance), version)
@@ -421,6 +467,12 @@ export class InstanceSupervisor {
     if (runtime.phase === 'running') return this.snapshot(id) as InstanceSnapshot
     if (!instance.enabled) throw new Error(`实例 ${id} 已禁用（enabled: false）`)
 
+    // 吸附：宿主自己那套 DSH 已经在跑了，这里不拉进程，只把镜像端点接到它身上。
+    const attach = decideAttach(instance, this.deps.hostSelf(), this.deps.localRuntime())
+    if (attach.attach) return await this.attachSelf(id, instance, runtime, attach.reason)
+    // 显式要求吸附却吸附不了：明说原因，不悄悄退回"自己拉一份"（那会起出第二套 DSH）。
+    if (instance.attach === true) throw new Error(`实例 ${id} 要求吸附，但做不到：${attach.reason}`)
+
     const subprocess = this.subprocess()
     const localTransport = instance.kind !== 'ssh'
     if (localTransport && subprocess === undefined) {
@@ -540,6 +592,9 @@ export class InstanceSupervisor {
       runtime.endpoint = endpoint
       this.setPhase(runtime, 'running', `运行中，远端端口 ${String(remotePort)}`)
       this.append(runtime, `镜像入口 ${info.entryUrl}`)
+      // 预热：实例一就绪就把远端那套前端先拉进镜像缓存。远端是按需拼 combo bundle 的
+      // （第一次要现读现拼几 MB），不预热的话这份成本就落在用户切过去的那一刻。
+      void this.warmMirror(runtime, endpoint, info.port)
       return this.snapshot(id) as InstanceSnapshot
     } catch (error) {
       const reason = describeError(error)
@@ -580,11 +635,205 @@ export class InstanceSupervisor {
       runtime.upstreamDescription = undefined
       runtime.error = undefined
       this.stopLogPump(runtime)
-      this.setPhase(runtime, 'stopped', '已停止')
+      // 吸附的实例没有自己的进程可停——只有镜像端点收摊，宿主那套 DSH 照旧在跑。
+      const detail =
+        runtime.attached === true ? '已停止镜像（宿主自身的 DSH 仍在运行，随时可再吸附）' : '已停止'
+      this.setPhase(runtime, 'stopped', detail)
+      this.append(runtime, detail)
       return this.snapshot(id) as InstanceSnapshot
     } finally {
       runtime.busy = false
     }
+  }
+
+  /**
+   * 桌面应用打开时，把「本机内置运行」那一条直接置为运行中——它本来就在跑。
+   *
+   * 返回吸附成功的实例 id；失败只记日志（面板里能看到原因），不阻塞宿主启动。
+   */
+  async autoAttach(): Promise<string[]> {
+    // 宿主自己的能力（web 端口 / 进程令牌 / 前端兜底路由）偶尔比本插件的 apply 稍晚就位。
+    // 这里只等"端口 + 令牌"；`/` 路由那条时序由 attachSelf 里的退避重试兜住。
+    const mightAttach = this.config.instances.some(
+      (instance) => instance.enabled && instance.kind === 'local' && instance.attach !== false,
+    )
+    if (mightAttach) {
+      const deadline = Date.now() + ATTACH_READY_TIMEOUT_MS
+      while (this.deps.hostSelf()?.tokenized !== true && Date.now() < deadline) {
+        await delay(ATTACH_POLL_MS)
+      }
+    }
+
+    const attached: string[] = []
+    for (const instance of this.config.instances) {
+      if (!instance.enabled) continue
+      const decision = decideAttach(instance, this.deps.hostSelf(), this.deps.localRuntime())
+      if (!decision.attach) continue
+      try {
+        await this.start(instance.id)
+        attached.push(instance.id)
+      } catch (error) {
+        this.append(this.runtimeOf(instance.id), `自动吸附失败：${describeError(error)}`)
+      }
+    }
+    return attached
+  }
+
+  /**
+   * 吸附宿主自身：不拉进程，只做两件事——
+   * 1. 用宿主自己的进程令牌换一次会话 cookie（就是桌面壳启动时用的那条路）；
+   * 2. 起一个镜像端点，把宿主自己的 UI 搬到**独立端口**上（挂在同端口会被桌面 guest 拦掉）。
+   *
+   * 这里有两处**必须等**的启动时序，都是实测踩出来的：
+   * - `connection` 服务可能比本插件的 apply 晚挂上 → 拿不到进程令牌，裸地址换不到 cookie；
+   * - 前端静态兜底（`/` 那条路由）在启动期还没注册 → 这时任何未匹配请求都会拿到 404。
+   * 所以：先等令牌到位，再换 cookie（换不到就退避重试几轮），而不是一失败就把实例钉成 error。
+   */
+  private async attachSelf(
+    id: string,
+    instance: RemoteDeskInstance,
+    runtime: Runtime,
+    reason: string,
+  ): Promise<InstanceSnapshot> {
+    runtime.busy = true
+    runtime.attached = true
+    runtime.error = undefined
+    runtime.exit = undefined
+    this.setPhase(runtime, 'starting', '正在吸附宿主自身的 DSH')
+    this.append(runtime, `吸附：${reason}`)
+    try {
+      const self = await this.waitForHostSelf(runtime, ATTACH_READY_TIMEOUT_MS)
+      if (self === undefined) throw new Error('拿不到宿主自身的 web 端口或进程令牌，无法吸附')
+      if (!self.tokenized) {
+        this.append(runtime, '宿主还没有给出进程令牌（connection 服务可能尚未挂载），仍按裸地址试一次')
+      }
+      this.append(runtime, `吸附目标：${maskToken(self.authenticatedUrl)}`)
+
+      const exchanged = await this.exchangeWithRetry(runtime, self)
+      this.append(runtime, `会话换取：${exchanged.detail}`)
+      if (!exchanged.ok || exchanged.cookie === undefined) {
+        throw new Error(`没能用宿主自己的令牌换到会话 cookie（${exchanged.detail}）`)
+      }
+      runtime.cookie = exchanged.cookie
+      runtime.remotePort = self.port
+
+      const connector = tcpUpstream('127.0.0.1', self.port, 'host-self')
+      runtime.upstreamDescription = connector.describe()
+      const { endpoint, info } = await this.startEndpoint(runtime, instance, self.port, connector)
+      runtime.endpoint = endpoint
+      this.setPhase(runtime, 'running', `运行中（吸附宿主自身，端口 ${String(self.port)}）`)
+      this.append(runtime, `镜像入口 ${info.entryUrl}`)
+      // 和普通启动一样预热：吸附的本机那台最该在应用刚起来时就把前端拉进缓存。
+      void this.warmMirror(runtime, endpoint, info.port)
+      return this.snapshot(id) as InstanceSnapshot
+    } catch (error) {
+      const message = describeError(error)
+      runtime.error = message
+      this.setPhase(runtime, 'error', message)
+      this.append(runtime, `吸附失败：${message}`)
+      await this.teardownEndpoint(runtime).catch(() => undefined)
+      return this.snapshot(id) as InstanceSnapshot
+    } finally {
+      runtime.busy = false
+    }
+  }
+
+  /**
+   * 等宿主自己的能力就位：端口 + 进程令牌。
+   *
+   * 优先等"令牌也到位"；超时后返回手里已有的那份（可能是裸地址），由调用方决定怎么兜。
+   */
+  private async waitForHostSelf(runtime: Runtime, timeoutMs: number): Promise<HostSelfEndpoint | undefined> {
+    const deadline = Date.now() + timeoutMs
+    let last = this.deps.hostSelf()
+    while (last?.tokenized !== true && Date.now() < deadline) {
+      await delay(ATTACH_POLL_MS)
+      last = this.deps.hostSelf() ?? last
+    }
+    if (last !== undefined && !last.tokenized && Date.now() >= deadline) {
+      this.append(runtime, `等了 ${String(Math.round(timeoutMs / 1000))} 秒仍没等到宿主进程令牌`)
+    }
+    return last
+  }
+
+  /**
+   * 预热镜像缓存：走一遍镜像自己（带票据），把首页里引用的前端资源都抓一遍。
+   *
+   * 为什么值得：远端那套前端是**按需组合**的——`plugins/??a,b,c&rev=…` 这种 URL 第一次请求时
+   * 远端才现读现拼（几 MB），用户看到的"渲染时间过长"主要就是这一段。实例一就绪就预热，
+   * 等用户切过去时这些资源已经在镜像端点的内存缓存里，第一屏几乎是立刻的。
+   *
+   * 纯尽力而为：失败、超时、时间不够都只写一行日志，绝不影响实例状态。
+   */
+  private async warmMirror(runtime: Runtime, endpoint: MirrorEndpoint, port: number): Promise<void> {
+    const deadline = Date.now() + WARMUP_TIMEOUT_MS
+    const cookie = `${TICKET_COOKIE}=${endpoint.ticketValue}`
+    const origin = `http://127.0.0.1:${String(port)}`
+    try {
+      const index = await fetch(`${origin}/`, { headers: { cookie, accept: 'text/html', 'accept-encoding': 'identity' } })
+      if (!index.ok) return
+      const html = await index.text()
+      const urls = new Set<string>()
+      for (const match of html.matchAll(/(?:src|href)="([^"]+)"/g)) {
+        const value = match[1] ?? ''
+        if (value.startsWith('http') || value.startsWith('data:')) continue
+        urls.add(value.startsWith('/') ? value : `/${value}`)
+      }
+      // `__DSH_BOOT__` 里的 bundle 图（`"url":"plugins/??…"`）；HTML 文本里的 `&` 可能是转义的。
+      for (const match of html.matchAll(/"url":"([^"]+)"/g)) {
+        urls.add(`/${(match[1] ?? '').replace(/&amp;/g, '&')}`)
+      }
+      const wanted = [...urls].filter((url) => /\.js|\.css|plugins\/|assets\/|chunks\//.test(url))
+      if (wanted.length === 0) return
+      const started = Date.now()
+      let done = 0
+      const queue = [...wanted]
+      const worker = async (): Promise<void> => {
+        for (;;) {
+          if (Date.now() > deadline) return
+          const next = queue.shift()
+          if (next === undefined) return
+          try {
+            // identity：让预热拿到的字节与浏览器能直接用的那份一致（别让压缩把缓存搞混）。
+            const response = await fetch(`${origin}${next}`, {
+              headers: { cookie, 'accept-encoding': 'identity' },
+            })
+            if (response.ok) {
+              done += 1
+              await response.arrayBuffer()
+            }
+          } catch {
+            /* 尽力而为 */
+          }
+        }
+      }
+      await Promise.all(Array.from({ length: WARMUP_CONCURRENCY }, worker))
+      this.append(
+        runtime,
+        `预热：${String(done)}/${String(wanted.length)} 个前端资源已进镜像缓存` +
+          `（${String(Math.round((Date.now() - started) / 100) / 10)} 秒，缓存 ${String(Math.round(endpoint.cachedBytes / 1024))} KB）`,
+      )
+    } catch (error) {
+      this.append(runtime, `预热跳过：${describeError(error)}`)
+    }
+  }
+
+  /** 会话换取：启动早期 `/` 可能还没被前端兜底认领（那时一律 404），所以退避重试几轮。 */
+  private async exchangeWithRetry(runtime: Runtime, self: HostSelfEndpoint): Promise<SessionExchange> {    let last: SessionExchange = { ok: false, status: 0, detail: '尚未尝试' }
+    for (let attempt = 1; attempt <= ATTACH_EXCHANGE_ATTEMPTS; attempt += 1) {
+      last = await exchangeSession(self.authenticatedUrl)
+      if (last.ok && last.cookie !== undefined) return last
+      if (attempt < ATTACH_EXCHANGE_ATTEMPTS) {
+        await delay(ATTACH_POLL_MS * 2)
+        // 令牌可能刚刚才到位：每轮都重新探一次，别拿启动早期那个裸地址试到底。
+        const fresh = this.deps.hostSelf()
+        if (fresh !== undefined && fresh.tokenized && !self.tokenized) {
+          self = fresh
+          this.append(runtime, `吸附目标更新为：${maskToken(fresh.authenticatedUrl)}`)
+        }
+      }
+    }
+    return last
   }
 
   async restart(id: string): Promise<InstanceSnapshot> {
@@ -655,9 +904,18 @@ export class InstanceSupervisor {
   ): Promise<{ endpoint: MirrorEndpoint; info: { port: number; entryUrl: string; baseUrl: string } }> {
     const range = this.portRange
     const candidates: number[] = []
+    // 上次用过的端口排在最前：镜像 origin（`http://127.0.0.1:<port>`）就是浏览器缓存的键，
+    // 也是镜像里那套 DSH 自己的 localStorage 的键。换端口 = 冷缓存 + 丢掉远端界面的界面偏好，
+    // 用户看到的就是"每次切过去都要重新渲染一遍"。所以能复用就复用。
+    const sticky = runtime.lastMirrorPort
+    if (sticky !== undefined && sticky > 0 && (range[0] === 0 || (sticky >= range[0] && sticky <= range[1]))) {
+      candidates.push(sticky)
+    }
     if (range[0] > 0) {
       const last = range[1] >= range[0] ? range[1] : range[0]
-      for (let port = range[0]; port <= last; port += 1) candidates.push(port)
+      for (let port = range[0]; port <= last; port += 1) {
+        if (port !== sticky) candidates.push(port)
+      }
     }
     candidates.push(0)
 
@@ -674,7 +932,8 @@ export class InstanceSupervisor {
       })
       try {
         const info = await endpoint.start()
-        if (port !== 0 && candidates.length > 1) {
+        runtime.lastMirrorPort = info.port
+        if (port !== 0 && candidates.length > 1 && port !== sticky) {
           this.append(runtime, `镜像端点使用配置范围内的端口 ${String(port)}`)
         }
         return { endpoint, info }
@@ -799,6 +1058,22 @@ function tailLines(text: string, limit = UPDATE_LOG_LINES): string[] {
     .map((line) => line.trimEnd())
     .filter((line) => line !== '')
     .slice(-limit)
+}
+
+/**
+ * 日志里要写"吸附目标是谁"，但**令牌不能进日志**——它是本进程的登录凭据。
+ * 这里保留 origin 与路径，只把令牌的值抹掉。
+ */
+export function maskToken(url: string): string {
+  try {
+    const parsed = new URL(url)
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (/token|key|secret|ticket/i.test(key)) parsed.searchParams.set(key, '***')
+    }
+    return parsed.href
+  } catch {
+    return url
+  }
 }
 
 async function probeTcp(host: string, port: number, timeoutMs = PROBE_TIMEOUT_MS): Promise<boolean> {
