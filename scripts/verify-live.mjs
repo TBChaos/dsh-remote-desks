@@ -67,6 +67,12 @@ function prepareProfile() {
     `        kind: local`,
     `        profile: ${localInstanceProfile}`,
     `        cwd: ${JSON.stringify(root)}`,
+    // 吸附宿主自身：这里显式 attach: true，于是宿主启动时就自动接上"已经在跑的那套 DSH"，
+    // 不另拉进程——桌面版里那条本机实例走的就是这条路。
+    `      - id: attach-self`,
+    `        kind: local`,
+    `        label: 本机（吸附宿主自身）`,
+    `        attach: true`,
     // 故意坏掉的实例：入口文件不存在，启动必然失败（用来验失败路径与可重试性）。
     `      - id: bad-entry`,
     `        kind: local`,
@@ -91,7 +97,7 @@ function prepareProfile() {
     `        cwd: ${JSON.stringify(root)}`,
   ]
   if (wslDistro !== '') {
-    instances.push(`      - id: m1-wsl`, `        kind: wsl`, `        distro: ${wslDistro}`, `        cwd: /home/zmh`)
+    instances.push(`      - id: m1-wsl`, `        kind: wsl`, `        distro: ${wslDistro}`, `        cwd: /tmp`)
     // 故意不打印就绪行的实例：验就绪超时路径（readyTimeoutMs 调小以免拖慢验证）。
     instances.push(
       `      - id: slow-wsl`,
@@ -107,7 +113,7 @@ function prepareProfile() {
       `        kind: wsl`,
       `        label: WSL 可更新`,
       `        distro: ${wslDistro}`,
-      `        cwd: /home/zmh`,
+      `        cwd: /tmp`,
       `        updateCommand: echo update-probe {version}`,
     )
   }
@@ -118,7 +124,7 @@ function prepareProfile() {
       `        host: 127.0.0.1`,
       `        port: ${String(sshPort)}`,
       `        username: dsh-test`,
-      `        cwd: /home/zmh`,
+      `        cwd: /tmp`,
       `        auth:`,
       `          method: password`,
       `          passwordCredential: ${sshCredentialRef}`,
@@ -131,7 +137,7 @@ function prepareProfile() {
       `        host: 127.0.0.1`,
       `        port: ${String(sshPort)}`,
       `        username: dsh-test`,
-      `        cwd: /home/zmh`,
+      `        cwd: /tmp`,
       `        updateCommand: echo update-probe {version}`,
       `        auth:`,
       `          method: password`,
@@ -261,7 +267,18 @@ async function verifyMirrorOf(running, id) {
     const assetPath = assetMatch[1].replace(/&amp;/g, '&').replace(/&#38;/g, '&')
     const asset = await get(`${running.mirrorBaseUrl}${assetPath}`, { cookie: mirrorCookie })
     check(`${id} 镜像里的子资源可取`, asset.status === 200, String(asset.status))
-    check(`${id} 子资源是客户端 bundle`, asset.text.startsWith('window.__ModuleLoader__.load({'))
+    check(
+      `${id} 子资源是客户端 bundle`,
+      asset.text.startsWith('window.__ModuleLoader__.load({'),
+      `长度 ${String(asset.text.length)}｜cache=${String(asset.headers['x-drd-cache'] ?? '-')}｜encoding=${String(asset.headers['content-encoding'] ?? '-')}｜开头 ${JSON.stringify(asset.text.slice(0, 60))}`,
+    )
+    // 同一份资源再取一次：应当由镜像端点的缓存直接回（远端那套是按需拼 bundle 的，这是"切过去很快"的关键）。
+    const assetAgain = await get(`${running.mirrorBaseUrl}${assetPath}`, { cookie: mirrorCookie })
+    check(
+      `${id} 第二次取同一份子资源走镜像缓存`,
+      assetAgain.status === 200 && assetAgain.text === asset.text && assetAgain.headers['x-drd-cache'] === 'hit',
+      `status=${String(assetAgain.status)} cache=${String(assetAgain.headers['x-drd-cache'] ?? '-')} 同样长度=${String(assetAgain.text.length === asset.text.length)}`,
+    )
   }
 
   const badTicket = await get(`${running.mirrorBaseUrl}?k=wrong`)
@@ -367,6 +384,82 @@ async function main() {
       const bundle = await get(`${base}/${url}`, { cookie })
       check('客户端 bundle 可取', bundle.status === 200, String(bundle.status))
       check('bundle 是 __ModuleLoader__ 形态', bundle.text.startsWith('window.__ModuleLoader__.load({'))
+    }
+
+    /* ── 吸附：本机实例接上「已经在跑」的宿主自己 ── */
+    console.log('\n[吸附] 宿主自身（打开即运行中，不另拉进程）')
+    const selfSnapshot = await awaitPhase(base, cookie, 'attach-self', 'running', 30_000)
+    check(
+      '吸附实例启动时自动进入 running',
+      selfSnapshot?.phase === 'running',
+      `${String(selfSnapshot?.phase)}：${String(selfSnapshot?.detail)}`,
+    )
+    check('快照带 attached 标记', selfSnapshot?.attached === true, String(selfSnapshot?.attached))
+    check(
+      '吸附的"远端端口"就是宿主端口',
+      selfSnapshot?.remotePort === port,
+      `${String(selfSnapshot?.remotePort)} vs ${String(port)}`,
+    )
+    check(
+      '上游是 host-self',
+      String(selfSnapshot?.upstream ?? '').includes('host-self'),
+      String(selfSnapshot?.upstream),
+    )
+    check('能力矩阵报告宿主端口', report?.host?.webPort === port, String(report?.host?.webPort))
+    check('能力矩阵报告可吸附', report?.host?.selfAttachable === true, String(report?.host?.selfAttachable))
+    check('配置里记下吸附实例数', report?.config?.attachInstances >= 1, String(report?.config?.attachInstances))
+    check(
+      '日志写明是吸附',
+      (selfSnapshot?.logs?.lines ?? []).some((line) => line.includes('吸附')),
+      (selfSnapshot?.logs?.lines ?? []).slice(-2).join(' | '),
+    )
+    check(
+      '吸附时没有起第二个进程（日志里没有启动命令）',
+      !(selfSnapshot?.logs?.lines ?? []).some((line) => line.includes('启动：')),
+    )
+
+    if (selfSnapshot?.phase === 'running') {
+      const noTicket = await get(selfSnapshot.mirrorBaseUrl)
+      check('吸附镜像端点无票据 → 403', noTicket.status === 403, String(noTicket.status))
+      const ticket = await get(selfSnapshot.mirrorEntryUrl)
+      check('吸附镜像票据换 cookie → 302', ticket.status === 302, String(ticket.status))
+      const selfCookie = cookieOf(ticket.headers)
+      const mirroredSelf = await get(selfSnapshot.mirrorBaseUrl, { cookie: selfCookie })
+      check('吸附镜像取回宿主 UI → 200', mirroredSelf.status === 200, String(mirroredSelf.status))
+      check('吸附镜像内容是 DSH 前端', mirroredSelf.text.includes('__DSH_BOOT__'), `长度 ${String(mirroredSelf.text.length)}`)
+      // 与远端实例正好相反：这里镜像的就是宿主自己那套，所以 boot 图里**有**本插件。
+      check('吸附镜像就是宿主自己那套（含本插件行）', mirroredSelf.text.includes('dsh-remote-desks'))
+
+      // 停止吸附只该收掉镜像端点，宿主自己必须毫发无损。
+      const stoppedSelf = await post(`${base}/remote-desks/api/instances/attach-self/stop`, { cookie })
+      check('停止吸附实例 → 200', stoppedSelf.status === 200, String(stoppedSelf.status))
+      const selfStopped = await awaitPhase(base, cookie, 'attach-self', 'stopped', 20_000)
+      check('吸附实例进入 stopped', selfStopped?.phase === 'stopped', String(selfStopped?.phase))
+      check('停止后不再暴露镜像地址', selfStopped?.mirrorBaseUrl === undefined, String(selfStopped?.mirrorBaseUrl))
+      const hostAlive = await get(`${base}/remote-desks/api/state`, { cookie })
+      check('停止吸附后宿主自己照旧在跑', hostAlive.status === 200, String(hostAlive.status))
+      check('停止说明里指出宿主仍在运行', String(selfStopped?.detail ?? '').includes('仍在运行'), String(selfStopped?.detail))
+
+      const reattach = await post(`${base}/remote-desks/api/instances/attach-self/start`, { cookie })
+      check('可以再吸附回来 → 200', reattach.status === 200, String(reattach.status))
+      const reattached = await awaitPhase(base, cookie, 'attach-self', 'running', 30_000)
+      check('再吸附后回到 running', reattached?.phase === 'running', String(reattached?.phase))
+      // 端口会被复用（配置把镜像端口限定在 19500-19510），所以这里不该断言"换了端口"，
+      // 该断言的是"新票据 + 镜像照旧取得到"——每次吸附都会铸一张新票据。
+      check(
+        '再吸附换了新票据',
+        typeof reattached?.mirrorEntryUrl === 'string' && reattached.mirrorEntryUrl !== selfSnapshot.mirrorEntryUrl,
+      )
+      if (reattached?.phase === 'running') {
+        const againTicket = await get(reattached.mirrorEntryUrl)
+        const againCookie = cookieOf(againTicket.headers)
+        const again = await get(reattached.mirrorBaseUrl, { cookie: againCookie })
+        check(
+          '再吸附后镜像照旧可取',
+          again.status === 200 && again.text.includes('__DSH_BOOT__'),
+          String(again.status),
+        )
+      }
     }
 
     /* ── M1/M2：多实例并发 ── */

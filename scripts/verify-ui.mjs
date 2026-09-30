@@ -72,6 +72,12 @@ function prepareProfile(openMode) {
       `        label: 本机预演实例`,
       `        profile: ${instanceProfile}`,
       `        cwd: ${JSON.stringify(root)}`,
+      // 第二台：验"切换实例"这条路（保活 = 切过去之后前一台不卸载、切回来是瞬间的）。
+      `      - id: ui-second`,
+      `        kind: local`,
+      `        label: 第二台预演实例`,
+      `        profile: ${instanceProfile}-2`,
+      `        cwd: ${JSON.stringify(root)}`,
       `    autoStart: []`,
       `    mirror: { host: 127.0.0.1, portRange: [19600, 19610], openMode: ${openMode} }`,
       `    announce: true`,
@@ -227,7 +233,11 @@ async function runOnce(openMode, outDir, electron) {
     await wait(1200)
     if (host.exitCode === null) host.kill('SIGKILL')
     if (!keep) {
-      for (const dir of [profileDir, join(dshHome, 'profiles', instanceProfile)]) {
+      for (const dir of [
+        profileDir,
+        join(dshHome, 'profiles', instanceProfile),
+        join(dshHome, 'profiles', `${instanceProfile}-2`),
+      ]) {
         try {
           rmSync(dir, { recursive: true, force: true })
         } catch {

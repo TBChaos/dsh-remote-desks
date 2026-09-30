@@ -8,7 +8,7 @@
 //   node scripts/verify-electron-local.mjs [--app <DeepSeek Harness.exe>] [--keep]
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { request as httpRequest } from 'node:http'
@@ -21,7 +21,18 @@ const argOf = (name, fallback) => {
 }
 const keep = args.includes('--keep')
 
-const appPath = argOf('app', 'D:\\Users\\TBChaos\\AppData\\Local\\Programs\\DeepSeek Harness\\DeepSeek Harness.exe')
+/**
+ * 桌面版安装路径：默认按 Windows 的标准安装位置推（`%LOCALAPPDATA%\Programs\DeepSeek Harness`），
+ * 装在别处就 `--app "<...>\DeepSeek Harness.exe"` 指一下。
+ */
+const defaultAppPath = join(
+  process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'),
+  'Programs',
+  'DeepSeek Harness',
+  'DeepSeek Harness.exe',
+)
+
+const appPath = argOf('app', defaultAppPath)
 const installation = dirname(appPath)
 const asarEntry = join(installation, 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
 

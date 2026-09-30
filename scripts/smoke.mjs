@@ -52,12 +52,31 @@ check('空配置补全 instances', Array.isArray(defaults.instances) && defaults
 check('空配置补全 autoStart', Array.isArray(defaults.autoStart))
 check('空配置补全 mirror.openMode', defaults.mirror?.openMode === 'auto', String(defaults.mirror?.openMode))
 check('空配置补全 mirror.portRange', Array.isArray(defaults.mirror?.portRange))
+check(
+  '空配置补全 switcher（默认上边中间，不挡图标）',
+  defaults.switcher?.enabled === true && defaults.switcher?.corner === 'top-center',
+  JSON.stringify(defaults.switcher),
+)
 const withInstance = host.Config({
   instances: [{ id: 'demo', kind: 'local' }],
 })
 check('实例默认 enabled', withInstance.instances[0]?.enabled === true)
 check('实例默认 jumpHosts', Array.isArray(withInstance.instances[0]?.jumpHosts))
 check('实例默认 auth.method=agent', withInstance.instances[0]?.auth?.method === 'agent', String(withInstance.instances[0]?.auth?.method))
+check('实例默认不写 attach（自动判定）', withInstance.instances[0]?.attach === undefined)
+const attachedConfig = host.Config({ instances: [{ id: 'demo', kind: 'local', attach: true }] })
+check('attach: true 被接受', attachedConfig.instances[0]?.attach === true)
+const detachedConfig = host.Config({ instances: [{ id: 'demo', kind: 'local', attach: false }] })
+check('attach: false 被接受', detachedConfig.instances[0]?.attach === false)
+const switcherConfig = host.Config({ switcher: { corner: 'top-left', offsetX: 8, offsetY: 8 } })
+check('switcher 可配置', switcherConfig.switcher.corner === 'top-left' && switcherConfig.switcher.offsetX === 8 && switcherConfig.switcher.enabled === true, JSON.stringify(switcherConfig.switcher))
+let badCornerRejected = false
+try {
+  host.Config({ switcher: { corner: 'middle' } })
+} catch {
+  badCornerRejected = true
+}
+check('非法 corner 被拒绝', badCornerRejected)
 const sshInstance = host.Config({ instances: [{ id: 'x', kind: 'ssh', host: 'h', username: 'u' }] })
 check('ssh 实例解析 host', sshInstance.instances[0]?.host === 'h')
 let badKindRejected = false
@@ -280,7 +299,15 @@ check('sidebar 入口 id 与面板 key 一致', panelEntry?.id === 'remote-desks
 const mainPanel = registered.find((options) => options.name === 'main')
 check('注册了 main 面板 key', mainPanel?.key === 'remote-desks', String(mainPanel?.key))
 check('sidebar 入口带中文标签', typeof panelEntry?.label === 'function' && panelEntry.label() === '远端工作台')
-check('注册总数=3', registered.length === 3, `实际 ${registered.length}`)
+check('注册总数=4', registered.length === 4, `实际 ${registered.length}`)
+const switcherEntry = registered.find((options) => options.name === 'shell.overlay')
+check('注册了窗口角上的切换器（shell.overlay）', switcherEntry !== undefined)
+check(
+  '切换器用独立 id（增量座位，不顶掉官方条目）',
+  switcherEntry?.id === 'remote-desks.switcher',
+  String(switcherEntry?.id),
+)
+check('注入了 shell.overlay', injected.includes('shell.overlay'))
 
 // 面板与控制接口/镜像容器链路的接线（静态检查，防回归）
 check('面板调用实例列表接口', source.includes('/api/instances'))
@@ -289,6 +316,27 @@ check('容器链含 iframe 兜底', source.includes('iframe'))
 check('容器链含系统浏览器兜底', source.includes('_blank'))
 check('容器链含官方右栏载体', source.includes('openTab') && source.includes('openRightbar'))
 check('容器偏好读取配置', source.includes('openMode'))
+// 抖动回归：dom-ready 对每次导航都触发，早先"每次 dom-ready 都重设 src"会变成无限重载。
+// 注意：bundle 里非 ASCII 会被 esbuild 转义（默认 charset=ascii），所以这里按标识符断言，
+// 不按中文文案断言。
+check('webview 导航只做一次（有 navigated 闸门）', /navigated/.test(source) && /if \(disposed \|\| navigated\) return/.test(source))
+check('导航后另有超时兜底', source.includes('postNavWatchdog'))
+check('guest 是空的会被探测到', source.includes('childElementCount'))
+check(
+  '载体会自动降级成内嵌框架',
+  (source.match(/setMode\(.iframe.\)/g) ?? []).length >= 3,
+  String((source.match(/setMode\(.iframe.\)/g) ?? []).length),
+)
+check('窗口角上有切换下拉框', source.includes('shell.overlay') && source.includes('drd-switch'))
+check(
+  '切换器会钻进窗口标题栏那一条（有标题栏时）',
+  source.includes('dsh-frame-top-clearance') && source.includes('useSwitcherPlacement') && /data-band/.test(source),
+)
+check('标题栏里可点（不是拖动区吞掉点击）', source.includes('-webkit-app-region') && source.includes('no-drag'))
+check('窗口尺寸变化会重算位置', source.includes("addEventListener(\"resize\"") || source.includes("addEventListener('resize'"))
+check('切换器与面板共用选中状态', source.includes('selectInstance') && source.includes('activeInstance'))
+check('客户端认识吸附标记', /attached ={2,3} true/.test(source))
+check('共享 store 只在有订阅者时轮询', source.includes('subscribeWorkbench') && source.includes('startPolling'))
 // partition 必须在 src 之前设置：它得在首次导航前就位。
 const attrAt = (name) => {
   const single = source.indexOf(`'${name}'`)
@@ -669,9 +717,153 @@ try {
   const panelHtml = renderToStaticMarkup(React.createElement(panel, { layout: renderCtx.layout, rightbar: renderCtx.sidebarRight }))
   check('面板能渲染出 HTML', panelHtml.length > 100, `${String(panelHtml.length)} 字符`)
   check('面板标题是中文名', panelHtml.includes('远端工作台'))
-  check('空配置时给出可操作提示', panelHtml.includes('cordis.patch.yml') || panelHtml.includes('还没有配置实例'))
+  // 首屏还在拉实例列表：这时该说"正在读取"，而不是急着教用户去改配置。
+  check('列表未就绪时给出读取提示', panelHtml.includes('正在读取实例列表'), panelHtml.slice(0, 160))
 } catch (error) {
   check('面板能渲染出 HTML', false, error instanceof Error ? error.message : String(error))
+}
+
+/* 7b. 面板与切换器：带真实状态的渲染（数据从 props 来，因此 SSR 也能测） */
+
+const PanelView = realExports.PanelView
+const SwitcherView = realExports.WorkbenchSwitcherView
+check('导出了 PanelView / WorkbenchSwitcherView', typeof PanelView === 'function' && typeof SwitcherView === 'function')
+
+const hostReportFixture = {
+  plugin: { name: 'dsh-remote-desks', displayName: '远端工作台', version: '0.1.0', milestone: 'M5' },
+  host: { platform: 'win32', arch: 'x64', node: '24', electron: '44', execPath: 'x', dshHome: null, dshProfile: null, webPort: 19387, selfAttachable: true },
+  services: { webServer: true },
+  runtime: { found: true, version: '0.2.0-rc.2', entry: 'app.asar/dsh/lib/bin.js', inAsar: true, via: 'process.argv[1]', attempts: [] },
+  control: { prefix: '/remote-desks', gate: 'loopback-guard' },
+  config: {
+    instances: 2,
+    enabledInstances: 2,
+    autoStart: 0,
+    openMode: 'auto',
+    attachInstances: 0,
+    switcher: 'top-right',
+    // 这一段测的是管理界面；统一界面在 7c 里单独测。
+    layout: { mode: 'manage', collapseSidebar: false },
+  },
+}
+const storeReady = {
+  host: { phase: 'ready', value: hostReportFixture },
+  instances: { phase: 'ready', value: [fixtureRunning, fixtureStopped] },
+  selected: 'wsl-ubuntu',
+}
+/** 同一份数据、选中运行中的那条：切换器要能反映"当前这台在跑"。 */
+const storeRunning = { ...storeReady, selected: 'local-dev' }
+const panelActions = {
+  refresh: () => {},
+  select: () => {},
+  lifecycle: async () => ({ ok: true }),
+  version: async () => ({ ok: true }),
+}
+
+try {
+  const html = renderToStaticMarkup(
+    React.createElement(PanelView, { store: storeReady, actions: panelActions, layout: renderCtx.layout, rightbar: renderCtx.sidebarRight }),
+  )
+  check('带数据的面板渲染出列表', html.includes('本机（内置运行时）') && html.includes('WSL · Ubuntu-24.04'))
+  check('面板按选中项显示（WSL 在前台的详情）', html.includes('WSL · Ubuntu-24.04') && html.includes('data-active="true"'))
+  check('未运行实例给出启动提示', html.includes('实例未运行') || html.includes('点「启动」'))
+  check('面板显示实例数量徽标', html.includes('2 个实例'))
+
+  const emptyPanel = renderToStaticMarkup(
+    React.createElement(PanelView, {
+      store: { host: storeReady.host, instances: { phase: 'ready', value: [] } },
+      actions: panelActions,
+      layout: renderCtx.layout,
+      rightbar: renderCtx.sidebarRight,
+    }),
+  )
+  check('没有配置实例时给出可操作提示', emptyPanel.includes('cordis.patch.yml'), emptyPanel.slice(0, 160))
+
+  const attachedPanel = renderToStaticMarkup(
+    React.createElement(PanelView, {
+      store: {
+        host: storeReady.host,
+        instances: {
+          phase: 'ready',
+          value: [
+            {
+              ...fixtureRunning,
+              attached: true,
+              detail: '运行中（吸附宿主自身，端口 19387）',
+              remotePort: 19387,
+            },
+            fixtureStopped,
+          ],
+        },
+        selected: 'local-dev',
+      },
+      actions: panelActions,
+      layout: renderCtx.layout,
+      rightbar: renderCtx.sidebarRight,
+    }),
+  )
+  check('吸附的实例在列表里写明吸附', attachedPanel.includes('吸附本机'), attachedPanel.slice(0, 200))
+  check('吸附的实例在详情的状态栏写明', attachedPanel.includes('吸附宿主自身'))
+} catch (error) {
+  check('带数据的面板渲染出列表', false, error instanceof Error ? error.message : String(error))
+}
+
+try {
+  const html = renderToStaticMarkup(
+    React.createElement(SwitcherView, {
+      store: storeRunning,
+      actions: { select: () => {} },
+      services: { layout: renderCtx.layout },
+    }),
+  )
+  check('切换器是一个下拉框', html.includes('<select'))
+  // 用户说"字太多"——下拉项只留关键字，"运行中"这类状态另有位置，长说明进 title。
+  check('下拉项只留关键字（去掉括注）', html.includes('>本机</option>'), html.slice(0, 400))
+  check('下拉项保留用户自己的关键字', html.includes('WSL · Ubuntu-24.04'))
+  check('下拉项不再带「（运行中）」这种尾巴', html.includes('（运行中）') === false)
+  check('长说明进了悬停提示', html.includes('运行中，远端端口'), html.slice(0, 400))
+  check('切换器标出当前选中项', html.includes('selected=""'), html.slice(0, 240))
+  check('切换器标出运行状态', html.includes('data-phase="running"'))
+  check('状态只写两三个字', html.includes('>运行中</span>'), html.slice(0, 400))
+  check('切换器默认贴上边中间（不挡右上角的图标）', html.includes('data-corner="top-center"'), html.slice(0, 200))
+  check('切换器把位置做成 CSS 变量（贴角时用得上）', html.includes('--drd-switch-x'))
+  // 顶部留空 = 跟随官方 --dsh-frame-overlay-top（桌面版 = 标题栏高度 + 20px），别写死像素。
+  check('默认不写死顶部像素，跟官方浮层基线', html.includes('--drd-switch-y') === false, html.slice(0, 240))
+} catch (error) {
+  check('切换器是一个下拉框', false, error instanceof Error ? error.message : String(error))
+}
+
+try {
+  const html = renderToStaticMarkup(
+    React.createElement(SwitcherView, {
+      store: storeReady,
+      actions: { select: () => {} },
+      services: { layout: renderCtx.layout },
+      preference: { enabled: false, corner: 'top-right', offsetX: 0, offsetY: 0 },
+    }),
+  )
+  check('switcher.enabled=false 时不渲染', html === '', html.slice(0, 80))
+
+  const leftHtml = renderToStaticMarkup(
+    React.createElement(SwitcherView, {
+      store: storeReady,
+      actions: { select: () => {} },
+      services: { layout: renderCtx.layout },
+      preference: { enabled: true, corner: 'top-left', offsetX: 12, offsetY: 12 },
+    }),
+  )
+  check('可以改贴左上角', leftHtml.includes('data-corner="top-left"') && leftHtml.includes('--drd-switch-x:12px'), leftHtml.slice(0, 200))
+
+  const emptyHtml = renderToStaticMarkup(
+    React.createElement(SwitcherView, {
+      store: { host: { phase: 'ready', value: hostReportFixture }, instances: { phase: 'ready', value: [] } },
+      actions: { select: () => {} },
+      services: { layout: renderCtx.layout },
+    }),
+  )
+  check('没有实例时不渲染空下拉框', emptyHtml === '')
+} catch (error) {
+  check('switcher.enabled=false 时不渲染', false, error instanceof Error ? error.message : String(error))
 }
 
 try {
@@ -782,6 +974,439 @@ check(
 check('内置运行时更新 → 409', (await call8('POST', '/remote-desks/api/instances/immutable/update')).statusCode === 409)
 check('POST rollback → 200', (await call8('POST', '/remote-desks/api/instances/a/rollback')).statusCode === 200)
 check('GET 打 update → 404', (await call8('GET', '/remote-desks/api/instances/a/update')).statusCode === 404)
+
+/* 7c. 统一界面（immersive）：远端那套 DSH 的界面铺满主区，我们只剩一条很轻的浮条 */
+
+const shortLabel = realExports.shortLabel
+const shortStatus = realExports.shortStatus
+const layoutModeOf = realExports.layoutModeOf
+check(
+  '导出了短标签 / 状态 / 形态判定',
+  typeof shortLabel === 'function' && typeof shortStatus === 'function' && typeof layoutModeOf === 'function',
+)
+check('短标签去掉括注', shortLabel(fixtureRunning) === '本机', shortLabel(fixtureRunning))
+check('短标签不重复类型词', shortLabel(fixtureStopped) === 'WSL · Ubuntu-24.04', shortLabel(fixtureStopped))
+check(
+  '短标签补类型词',
+  shortLabel({ id: 'vm-1', kind: 'ssh', label: '虚拟机 Ubuntu', phase: 'stopped' }) === 'SSH · 虚拟机 Ubuntu',
+  shortLabel({ id: 'vm-1', kind: 'ssh', label: '虚拟机 Ubuntu', phase: 'stopped' }),
+)
+check('没有 label 时退回 id', shortLabel({ id: 'vm-1', kind: 'ssh', phase: 'stopped' }) === 'SSH · vm-1', shortLabel({ id: 'vm-1', kind: 'ssh', phase: 'stopped' }))
+check('状态词：运行中', shortStatus(fixtureRunning) === '运行中', shortStatus(fixtureRunning))
+check('状态词：吸附时叫已连接', shortStatus({ ...fixtureRunning, attached: true }) === '已连接')
+check('状态词：未启动', shortStatus(fixtureStopped) === '未启动', shortStatus(fixtureStopped))
+check('状态词：出错', shortStatus({ ...fixtureRunning, phase: 'error' }) === '出错')
+check('形态默认跟随配置', layoutModeOf(storeReady) === 'manage', String(layoutModeOf(storeReady)))
+check(
+  '用户点过就以用户为准',
+  layoutModeOf({ ...storeReady, layoutOverride: 'immersive' }) === 'immersive',
+)
+check(
+  '配置默认是统一界面',
+  layoutModeOf({ ...storeReady, host: { phase: 'ready', value: { ...hostReportFixture, config: { ...hostReportFixture.config, layout: { mode: 'immersive' } } } } }) === 'immersive',
+)
+
+const storeImmersive = {
+  ...storeReady,
+  layoutOverride: 'immersive',
+}
+const immersiveHost = {
+  phase: 'ready',
+  value: { ...hostReportFixture, config: { ...hostReportFixture.config, layout: { mode: 'immersive', collapseSidebar: false } } },
+}
+
+try {
+  const html = renderToStaticMarkup(
+    React.createElement(PanelView, { store: { ...storeImmersive, selected: 'local-dev' }, actions: panelActions, layout: renderCtx.layout, rightbar: renderCtx.sidebarRight }),
+  )
+  check('统一界面铺满（drd-immersive）', html.includes('drd-immersive'))
+  check('统一界面下没有实例列表与工具栏', html.includes('drd-list') === false && html.includes('drd-toolbar') === false)
+  // SSR 不跑 effect，所以镜像载体（iframe/webview）在这层看不到；这里断言"镜像区在、且铺满由 CSS 负责"，
+  // 真的铺满由 verify:ui 在浏览器里量矩形。
+  check('统一界面下有镜像区', html.includes('drd-stage'), html.slice(0, 240))
+  check('浮条有关键字与状态', html.includes('>本机<') && html.includes('运行中'))
+  check('浮条有「管理」出口', html.includes('>管理</button>'))
+  check('浮条有「全窗口」与「重载」', html.includes('>全窗口</button>') && html.includes('>重载</button>'))
+
+  // 未运行 → 不是把人丢进管理界面，而是给一个能直接启动的卡片。
+  const stoppedHtml = renderToStaticMarkup(
+    React.createElement(PanelView, { store: { ...storeImmersive, selected: 'wsl-ubuntu' }, actions: panelActions, layout: renderCtx.layout, rightbar: renderCtx.sidebarRight }),
+  )
+  check('未运行时给启动卡片', stoppedHtml.includes('>启动</button>') && stoppedHtml.includes('WSL · Ubuntu-24.04'))
+  check('未运行时也留着「管理界面」出口', stoppedHtml.includes('管理界面'))
+
+  // 配置里的默认形态：没被用户覆盖时按配置走。
+  const configuredHtml = renderToStaticMarkup(
+    React.createElement(PanelView, {
+      store: { host: immersiveHost, instances: { phase: 'ready', value: [fixtureRunning, fixtureStopped] }, selected: 'local-dev' },
+      actions: panelActions,
+      layout: renderCtx.layout,
+      rightbar: renderCtx.sidebarRight,
+    }),
+  )
+  check('配置成统一界面时首屏就是统一界面', configuredHtml.includes('drd-immersive'))
+
+  const managedHtml = renderToStaticMarkup(
+    React.createElement(PanelView, {
+      store: { ...storeImmersive, layoutOverride: 'manage' },
+      actions: panelActions,
+      layout: renderCtx.layout,
+      rightbar: renderCtx.sidebarRight,
+    }),
+  )
+  check('切回管理界面后列表与工具栏都在', managedHtml.includes('drd-list') && managedHtml.includes('drd-toolbar'))
+  check('管理界面里有「统一界面」出口', managedHtml.includes('>统一界面</button>'))
+
+  // 保活（切到另一台时前一台不卸载）需要组件内 state，SSR 跑不到 effect——
+  // 这条留给 verify:ui 在浏览器里用**两个实例**真真切切地切一次（见 scripts/ui-verify/main.cjs）。
+  check('统一界面同一时刻只渲染当前这台（首次渲染）', (html.match(/drd-keep/g) ?? []).length === 1, String((html.match(/drd-keep/g) ?? []).length))
+} catch (error) {
+  check('统一界面铺满（drd-immersive）', false, error instanceof Error ? error.message : String(error))
+}
+
+/* ── 9. 吸附宿主自身（本机内置运行 = 已经在跑） ── */
+
+console.log('\n[9] 吸附宿主自身（attach：不拉进程，直接接上在跑的那套 DSH）')
+const attachMod = await import(pathToFileURL(resolve(root, 'lib/instances/attach.js')).href)
+const { InstanceSupervisor } = await import(pathToFileURL(resolve(root, 'lib/instances/supervisor.js')).href)
+const { createServer } = await import('node:http')
+
+// host 半的快照里要真的带 attached 标记（客户端据此显示"吸附本机"）。
+const supervisorSource = readFileSync(resolve(root, 'lib/instances/supervisor.js'), 'utf8')
+check('快照带 attached 标记', supervisorSource.includes('attached === true') && supervisorSource.includes('attached: true'))
+check('吸附实现里没有 terminate', /attachSelf[\s\S]{0,4000}?terminate/.test(supervisorSource) === false)
+
+const attachLocal = { id: 'local-dev', kind: 'local', enabled: true, jumpHosts: [] }
+const attachWsl = { id: 'wsl', kind: 'wsl', enabled: true, distro: 'Ubuntu', jumpHosts: [] }
+const desktopRuntime = { entry: 'C:/app/app.asar/dsh/lib/bin.js', execPath: 'C:/app/x.exe', electron: true, inAsar: true }
+const cliRuntime = { entry: 'C:/npm/dsh/lib/bin.js', execPath: 'C:/node/node.exe', electron: false, inAsar: false }
+const selfFixture = { port: 19387, authenticatedUrl: 'http://127.0.0.1:19387/?token=t', tokenized: true, describe: '宿主自身' }
+
+check('桌面内置运行时 + 本机实例 → 吸附', attachMod.decideAttach(attachLocal, selfFixture, desktopRuntime).attach === true)
+check(
+  'attach: false → 不吸附',
+  attachMod.decideAttach({ ...attachLocal, attach: false }, selfFixture, desktopRuntime).attach === false,
+)
+check(
+  '非桌面宿主 → 不吸附（老行为不变）',
+  attachMod.decideAttach(attachLocal, selfFixture, cliRuntime).attach === false,
+)
+check(
+  '显式 attach: true → 任何宿主都吸附',
+  attachMod.decideAttach({ ...attachLocal, attach: true }, selfFixture, cliRuntime).attach === true,
+)
+check(
+  '指定了别的入口 → 不吸附',
+  attachMod.decideAttach({ ...attachLocal, entry: 'D:/other/lib/bin.js' }, selfFixture, desktopRuntime).attach === false,
+)
+check(
+  '拿不到宿主端点 → 不吸附，并说明原因',
+  (() => {
+    const decision = attachMod.decideAttach(attachLocal, undefined, desktopRuntime)
+    return decision.attach === false && decision.reason.includes('无法吸附')
+  })(),
+)
+check('wsl 实例不参与吸附', attachMod.decideAttach(attachWsl, selfFixture, desktopRuntime).attach === false)
+
+// 一个真的会「303 + set-cookie」的假宿主：模拟桌面壳启动时那条换取会话的路。
+// 顺带模拟启动早期的两件事：前两次带令牌的请求返回 404（前端兜底路由还没认领 `/`），
+// 以及最开始几次探测拿不到进程令牌（connection 服务还没挂上）。
+const hostHits = []
+let spawnCalls = 0
+let earlyMisses = 2
+let bundleHits = 0
+const fakeHost = createServer((req, res) => {
+  hostHits.push(req.url ?? '')
+  if ((req.url ?? '').startsWith('/?token=')) {
+    if (earlyMisses > 0) {
+      earlyMisses -= 1
+      res.writeHead(404)
+      res.end()
+      return
+    }
+    res.writeHead(303, { 'set-cookie': ['dsh-auth-host=v1.test; Path=/; HttpOnly'], location: '/' })
+    res.end()
+    return
+  }
+  // 前端 bundle：带内容哈希（`rev=`），镜像端点的缓存只认这种。
+  if ((req.url ?? '').startsWith('/plugins/')) {
+    bundleHits += 1
+    res.writeHead(200, {
+      'content-type': 'text/javascript; charset=utf-8',
+      'cache-control': 'public, max-age=31536000, immutable',
+    })
+    res.end('window.__ModuleLoader__ = { load() {} };')
+    return
+  }
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+  res.end(
+    '<!doctype html><html><body><div id="root">host-ui</div>' +
+      '<script src="plugins/??a,b&rev=deadbeef"></script></body></html>',
+  )
+})
+await new Promise((done) => fakeHost.listen(0, '127.0.0.1', done))
+const hostPort = fakeHost.address().port
+
+let selfProbes = 0
+const selfWithDelay = () => {
+  selfProbes += 1
+  // 前三次：端口有了，但拿不到进程令牌（裸地址换不到 cookie）。
+  const tokenized = selfProbes > 3
+  return {
+    port: hostPort,
+    authenticatedUrl: tokenized
+      ? `http://127.0.0.1:${String(hostPort)}/?token=smoke`
+      : `http://127.0.0.1:${String(hostPort)}/`,
+    tokenized,
+    describe: '宿主自身',
+  }
+}
+
+const supervisor = new InstanceSupervisor(
+  { instances: [attachLocal], mirror: { host: '127.0.0.1', portRange: [0, 0] } },
+  {
+    dshHome: resolve(root, '.recon', 'smoke-dsh-home'),
+    localRuntime: () => desktopRuntime,
+    hostSelf: selfWithDelay,
+    resolveCredential: async () => undefined,
+    log: () => {},
+  },
+  // 宿主"没有" subprocess 服务：真去拉进程就会失败，因此吸附成功本身证明它没拉进程。
+  () => {
+    spawnCalls += 1
+    return undefined
+  },
+)
+
+const attachedSnapshot = await supervisor.start('local-dev')
+check('吸附后 phase=running', attachedSnapshot.phase === 'running', String(attachedSnapshot.phase))
+check('吸附后带 attached 标记', attachedSnapshot.attached === true)
+check('吸附不调用 subprocess', spawnCalls === 0, `实际 ${String(spawnCalls)}`)
+check('吸附的远端端口就是宿主端口', attachedSnapshot.remotePort === hostPort, String(attachedSnapshot.remotePort))
+check('吸附后给出镜像入口', typeof attachedSnapshot.mirrorEntryUrl === 'string', String(attachedSnapshot.mirrorEntryUrl))
+check('吸附走的是宿主令牌地址', hostHits.some((url) => url.includes('token=smoke')), JSON.stringify(hostHits))
+check('等到了进程令牌（不是拿裸地址硬试）', selfProbes > 3, `探测 ${String(selfProbes)} 次`)
+check(
+  '启动早期的 404 被退避重试吃掉了',
+  hostHits.filter((url) => url.includes('token=')).length >= 3,
+  JSON.stringify(hostHits.slice(0, 6)),
+)
+check('吸附说明写在 detail 里', String(attachedSnapshot.detail).includes('吸附宿主自身'), String(attachedSnapshot.detail))
+
+// 预热：实例一就绪就把首页里引用的前端资源先拉进镜像缓存（远端那套是按需拼 combo bundle 的，
+// 不预热的话这份成本就落在用户切过去那一刻）。
+const warmDeadline = Date.now() + 15_000
+while (Date.now() < warmDeadline && !supervisor.logs('local-dev', 0).lines.some((line) => line.includes('预热：'))) {
+  await new Promise((done) => setTimeout(done, 200))
+}
+const warmLogs = supervisor.logs('local-dev', 0).lines
+check(
+  '就绪后自己预热前端资源',
+  warmLogs.some((line) => line.includes('预热：') && line.includes('/1 个前端资源')),
+  warmLogs.filter((line) => line.includes('预热')).join(' | ').slice(0, 160),
+)
+check('预热真的去取了那个 bundle', bundleHits >= 1, `上游收到 ${String(bundleHits)} 次`)
+
+// 缓存：再取一次同一个 bundle，应当由镜像端点自己回（上游次数不再增加）。
+const bundleResponse = await fetch(`${attachedSnapshot.mirrorBaseUrl}plugins/??a,b&rev=deadbeef`, {
+  headers: { cookie: `dsh_mirror=${decodeURIComponent(new URL(attachedSnapshot.mirrorEntryUrl).searchParams.get('k') ?? '')}` },
+})
+const cachedBody = await bundleResponse.text()
+check('带票据能取到 bundle', bundleResponse.status === 200, String(bundleResponse.status))
+const hitsAfterWarm = bundleHits
+const second = await fetch(`${attachedSnapshot.mirrorBaseUrl}plugins/??a,b&rev=deadbeef`, {
+  headers: { cookie: `dsh_mirror=${decodeURIComponent(new URL(attachedSnapshot.mirrorEntryUrl).searchParams.get('k') ?? '')}` },
+})
+check('同一份 bundle 走镜像缓存（上游不再被敲）', bundleHits === hitsAfterWarm, `上游次数 ${String(bundleHits)}`)
+check('缓存回包带 x-drd-cache: hit', second.headers.get('x-drd-cache') === 'hit', String(second.headers.get('x-drd-cache')))
+check('缓存内容与第一次一致', (await second.text()) === cachedBody)
+// 没带哈希的路径不缓存（避免把 `/api/*` 那种动态内容也存下来）。
+const upstreamHitsBeforeDynamic = hostHits.length
+await fetch(`${attachedSnapshot.mirrorBaseUrl}`, {
+  headers: { cookie: `dsh_mirror=${decodeURIComponent(new URL(attachedSnapshot.mirrorEntryUrl).searchParams.get('k') ?? '')}` },
+})
+check('不带哈希的页面不进缓存', hostHits.length > upstreamHitsBeforeDynamic, `上游 ${String(hostHits.length - upstreamHitsBeforeDynamic)} 次`)
+
+// 镜像端点要真的能把宿主那套 UI 搬过来：带票据 → 换 cookie → 取回内容。
+const entry = attachedSnapshot.mirrorEntryUrl
+const first = await fetch(entry, { redirect: 'manual' })
+const ticketCookie = (first.headers.getSetCookie?.() ?? [])[0]?.split(';')[0] ?? ''
+check('带票据访问镜像 → 302', first.status === 302, String(first.status))
+check('换取镜像票据 cookie', ticketCookie.startsWith('dsh_mirror='), ticketCookie)
+const mirrored = await fetch(entry.split('?')[0], { headers: { cookie: ticketCookie } })
+const mirroredBody = await mirrored.text()
+check('带票据 cookie 取回宿主 UI → 200', mirrored.status === 200, String(mirrored.status))
+check('镜像回来的就是宿主那一屏', mirroredBody.includes('host-ui'), mirroredBody.slice(0, 80))
+const naked = await fetch(entry.split('?')[0])
+check('无票据仍被拒', naked.status === 403, String(naked.status))
+
+// 预检：吸附的实例不再问 profile / cwd，只回答吸附本身。
+const checked = await supervisor.check('local-dev')
+check('预检回答吸附而不是 profile', checked.checks[0]?.name === '吸附宿主自身', JSON.stringify(checked.checks[0]))
+check('预检第一项通过', checked.checks[0]?.ok === true)
+
+// 停止只收镜像，不动宿主。
+const stoppedSnapshot = await supervisor.stop('local-dev')
+check('停止吸附实例 → stopped', stoppedSnapshot.phase === 'stopped', String(stoppedSnapshot.phase))
+check('停止吸附实例不动宿主', fakeHost.listening === true)
+check('停止后不再暴露镜像地址', stoppedSnapshot.mirrorEntryUrl === undefined)
+check('停止说明仍指出宿主在跑', String(stoppedSnapshot.detail).includes('宿主自身的 DSH 仍在运行'), String(stoppedSnapshot.detail))
+
+// 再吸附一次：镜像 origin 必须复用（浏览器缓存 + 镜像里那套 DSH 自己的 localStorage 都挂在 origin 上，
+// 换端口 = 冷缓存 + 丢掉远端界面的偏好，用户看到的就是"每次切过去都要重新渲染"）。
+const reattachedSmoke = await supervisor.start('local-dev')
+check(
+  '再吸附复用同一个镜像端口',
+  reattachedSmoke.mirrorBaseUrl === attachedSnapshot.mirrorBaseUrl,
+  `${String(attachedSnapshot.mirrorBaseUrl)} → ${String(reattachedSmoke.mirrorBaseUrl)}`,
+)
+check(
+  '复用端口时入口票据是新的',
+  reattachedSmoke.mirrorEntryUrl !== attachedSnapshot.mirrorEntryUrl,
+  String(reattachedSmoke.mirrorEntryUrl),
+)
+await supervisor.dispose()
+
+// autoAttach：桌面应用打开时该自己接上，不需要用户点。
+const autoSupervisor = new InstanceSupervisor(
+  {
+    instances: [attachLocal, { ...attachLocal, id: 'local-off', attach: false }, attachWsl],
+    mirror: { host: '127.0.0.1', portRange: [0, 0] },
+  },
+  {
+    dshHome: resolve(root, '.recon', 'smoke-dsh-home'),
+    localRuntime: () => desktopRuntime,
+    hostSelf: () => ({
+      port: hostPort,
+      authenticatedUrl: `http://127.0.0.1:${String(hostPort)}/?token=smoke`,
+      tokenized: true,
+      describe: '宿主自身',
+    }),
+    resolveCredential: async () => undefined,
+    log: () => {},
+  },
+  () => undefined,
+)
+const autoAttached = await autoSupervisor.autoAttach()
+check('autoAttach 只接上该吸附的那条', JSON.stringify(autoAttached) === '["local-dev"]', JSON.stringify(autoAttached))
+const autoSnapshot = autoSupervisor.snapshot('local-dev')
+check('autoAttach 后就是运行中（打开应用即运行中）', autoSnapshot?.phase === 'running')
+await autoSupervisor.dispose()
+await new Promise((done) => fakeHost.close(done))
+
+/* ── 10. 票据 cookie 的跨站形态（桌面版 iframe 的命门） ── */
+
+console.log('\n[10] 票据 cookie：跨站 iframe 也要能用')
+const endpointMod = await import(pathToFileURL(resolve(root, 'lib/mirror/endpoint.js')).href)
+const upstreamMod = await import(pathToFileURL(resolve(root, 'lib/mirror/upstream.js')).href)
+
+check('跨站判定：cross-site 为真', endpointMod.isCrossSite({ headers: { 'sec-fetch-site': 'cross-site' } }) === true)
+check('跨站判定：same-origin 为假', endpointMod.isCrossSite({ headers: { 'sec-fetch-site': 'same-origin' } }) === false)
+check('跨站判定：same-site 为假', endpointMod.isCrossSite({ headers: { 'sec-fetch-site': 'same-site' } }) === false)
+// 桌面版顶层是 dsh-app://app，浏览器一般会写 cross-site；拿不到这个头时按最保守的跨站处理。
+check('跨站判定：缺头按跨站处理', endpointMod.isCrossSite({ headers: {} }) === true)
+const crossCookie = endpointMod.ticketCookie('TICKET', true)
+check(
+  '跨站 cookie 是 SameSite=None; Secure',
+  crossCookie.includes('SameSite=None') && crossCookie.includes('Secure'),
+  crossCookie,
+)
+check('跨站 cookie 仍旧 HttpOnly 且 Path=/', crossCookie.includes('HttpOnly') && crossCookie.includes('Path=/'), crossCookie)
+// 缓存判据：只认内容寻址的静态资源，且**只认未压缩的**——预热的 fetch 会自动解压，
+// 若把它存进同一个 key，浏览器按 gzip 去解就会炸（活体验证里翻过一次车）。
+check(
+  'cacheableResponse 认得带 rev 的 combo bundle',
+  endpointMod.cacheableResponse('GET', '/plugins/??a,b&rev=deadbeef', 200, { 'content-type': 'text/javascript; charset=utf-8' }) !== undefined,
+)
+check(
+  'cacheableResponse 认得带哈希的 assets',
+  endpointMod.cacheableResponse('GET', '/assets/index-abcdef12.js', 200, { 'content-type': 'text/javascript' }) !== undefined,
+)
+check(
+  'cacheableResponse 拒绝带 content-encoding 的响应',
+  endpointMod.cacheableResponse('GET', '/plugins/??a,b&rev=deadbeef', 200, {
+    'content-type': 'text/javascript',
+    'content-encoding': 'gzip',
+  }) === undefined,
+)
+check(
+  'cacheableResponse 拒绝 /api/ 与无哈希路径',
+  endpointMod.cacheableResponse('GET', '/api/state?rev=x', 200, { 'content-type': 'application/json' }) === undefined &&
+    endpointMod.cacheableResponse('GET', '/plugins/??a,b', 200, { 'content-type': 'text/javascript' }) === undefined,
+)
+check(
+  'cacheableResponse 只认 GET 200',
+  endpointMod.cacheableResponse('POST', '/plugins/??a&rev=x', 200, { 'content-type': 'text/javascript' }) === undefined &&
+    endpointMod.cacheableResponse('GET', '/plugins/??a&rev=x', 404, { 'content-type': 'text/javascript' }) === undefined,
+)
+const sameCookie = endpointMod.ticketCookie('TICKET', false)
+check(
+  '同站 cookie 仍旧是 Lax（少给一点权限）',
+  sameCookie.includes('SameSite=Lax') && sameCookie.includes('Secure') === false,
+  sameCookie,
+)
+
+// 端到端：跨站访客带票据 → 302 + 跨站 cookie → 带 cookie 取回上游内容；不带就 403。
+const ticketUpstream = createServer((_req, res) => {
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+  res.end('<!doctype html><html><body>upstream-ok</body></html>')
+})
+await new Promise((done) => ticketUpstream.listen(0, '127.0.0.1', done))
+const ticketUpstreamPort = ticketUpstream.address().port
+const endpoint = new endpointMod.MirrorEndpoint({
+  instanceId: 'cross-site-probe',
+  remotePort: ticketUpstreamPort,
+  connector: upstreamMod.tcpUpstream('127.0.0.1', ticketUpstreamPort, 'local'),
+  cookie: () => undefined,
+  bindHost: '127.0.0.1',
+  port: 0,
+})
+const endpointInfo = await endpoint.start()
+try {
+  const exchanged = await fetch(endpointInfo.entryUrl, {
+    redirect: 'manual',
+    headers: { 'sec-fetch-site': 'cross-site' },
+  })
+  const setCookie = (exchanged.headers.getSetCookie?.() ?? [])[0] ?? ''
+  check('跨站访客带票据 → 302', exchanged.status === 302, String(exchanged.status))
+  check('换到的 cookie 是跨站形态', /SameSite=None/i.test(setCookie) && /Secure/i.test(setCookie), setCookie)
+  const pair = setCookie.split(';')[0]
+  const mirrored = await fetch(endpointInfo.baseUrl, { headers: { cookie: pair } })
+  check('带上它就能取回上游内容', mirrored.status === 200 && (await mirrored.text()).includes('upstream-ok'), String(mirrored.status))
+  const bare = await fetch(endpointInfo.baseUrl)
+  check('不带票据仍旧 403（闸门还在）', bare.status === 403, String(bare.status))
+  const sameSiteExchange = await fetch(endpointInfo.entryUrl, {
+    redirect: 'manual',
+    headers: { 'sec-fetch-site': 'same-origin' },
+  })
+  const sameSiteCookie = (sameSiteExchange.headers.getSetCookie?.() ?? [])[0] ?? ''
+  check('同站访客拿到的是 Lax', sameSiteCookie.includes('SameSite=Lax'), sameSiteCookie)
+} finally {
+  await endpoint.close()
+  await new Promise((done) => ticketUpstream.close(done))
+}
+
+// 显式要求吸附却吸附不了：明说，不悄悄退回"自己拉一份"。
+const noSelfSupervisor = new InstanceSupervisor(
+  { instances: [{ ...attachLocal, attach: true }], mirror: { host: '127.0.0.1', portRange: [0, 0] } },
+  {
+    dshHome: resolve(root, '.recon', 'smoke-dsh-home'),
+    localRuntime: () => desktopRuntime,
+    hostSelf: () => undefined,
+    resolveCredential: async () => undefined,
+    log: () => {},
+  },
+  () => undefined,
+)
+let refusal = ''
+try {
+  await noSelfSupervisor.start('local-dev')
+} catch (error) {
+  refusal = error instanceof Error ? error.message : String(error)
+}
+check('吸附不了时明确拒绝', refusal.includes('要求吸附'), refusal)
+check('拒绝时不假装运行中', noSelfSupervisor.snapshot('local-dev')?.phase !== 'running')
+await noSelfSupervisor.dispose()
 
 /* ── 汇总 ── */
 
