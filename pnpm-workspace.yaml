@@ -1,5 +1,10 @@
 # pnpm settings for this repository.
 #
+# 这里**必须**有 `packages`：从 pnpm 9 起，工作区文件缺这一项会让 `pnpm store path` 一类命令
+# 直接报 "packages field missing or empty"（CI 上就是这么翻的车）。单包仓库写 `['.']` 即可。
+packages:
+  - '.'
+#
 # `minimumReleaseAgeExclude` lists the pinned @deepseek-ai/dsh-* prereleases:
 # pnpm's minimum-release-age policy would otherwise refuse these rc builds, which
 # are the exact versions the DSH 0.2.0-rc.1 runtime provides. Regenerate this

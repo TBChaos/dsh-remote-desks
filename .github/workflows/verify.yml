@@ -18,13 +18,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 版本跟着 package.json 的 `packageManager`（pnpm@11.7.0），别在这里另写一个版本号：
+      # 这个仓库的 pnpm-workspace.yaml 用的是 pnpm 10+ 的设置（allowBuilds 等），版本错会读不懂。
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
 
       - name: 安装依赖
