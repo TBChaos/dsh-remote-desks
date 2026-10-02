@@ -15,3 +15,11 @@ desktop.ini
 
 # 日志
 *.log
+
+# 视频脚本（分镜 / 逐字稿 / 字幕）：拍摄素材，只在本地留着，不跟代码一起发布。
+# 视频与 GIF 本身可以进库（README 要用），脚本不进。
+docs/video-script.md
+docs/*video*.md
+docs/*分镜*.md
+docs/*逐字稿*.md
+docs/*.srt
