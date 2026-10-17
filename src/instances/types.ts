@@ -54,6 +54,10 @@ export interface UpdateOutcome {
   id: string
   ok: boolean
   kind: 'update' | 'rollback'
+  /** 这次真正拿去的目标（版本号或 dist-tag），面板要显示它。 */
+  target: string
+  /** 目标就是目标当前版本（或比它新）时**不会跑命令**，直接返回 skipped。 */
+  skipped: boolean
   command: string
   before: { ok: boolean; version?: string; source: string; detail: string }
   after: { ok: boolean; version?: string; source: string; detail: string }
@@ -101,6 +105,14 @@ export interface HostSelfEndpoint {
 export interface SupervisorDeps {
   /** 解析本机 DSH 发行版入口；拿不到就无法拉起本机实例。 */
   localRuntime: () => LocalRuntime | undefined
+  /**
+   * 宿主自己这套 DSH 的版本。
+   *
+   * 「更新」的默认目标就是它——用户的真实意图几乎总是"让这台机器跟桌面版一个版本"，
+   * 而 npm 的 `latest` 标签未必指向桌面版用的那一版（实测：桌面版 0.2.1-rc.2，latest 还是
+   * 0.2.0-rc.2，于是"更新"只会原地重装一遍，看起来就是"无法更新"）。
+   */
+  hostVersion?: () => string | undefined
   /** 宿主自身的端点；拿不到就无法吸附。 */
   hostSelf: () => HostSelfEndpoint | undefined
   /** DSH_HOME，用于放置自动创建的 profile。 */

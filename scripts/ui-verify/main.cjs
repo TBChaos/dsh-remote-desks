@@ -437,6 +437,15 @@ async function main() {
       const runningText = (await js('document.querySelector(".drd-toolbar").innerText')).replace(/\n/g, ' / ')
       record('面板显示运行中', true, runningText)
       record('工具栏含「更新」', runningText.includes('更新'))
+      // 「更新到」输入框：留空跟桌面版同版本，也可以填 next / 具体版本。
+      const targetInput = await js(`
+        (() => {
+          const input = document.querySelector('.drd-toolbar input.drd-input')
+          if (input === null) return 'missing'
+          return JSON.stringify({ placeholder: input.placeholder, disabled: input.disabled })
+        })()
+      `)
+      record('工具栏有「更新到」输入框（可编辑）', typeof targetInput === 'string' && targetInput.includes('"disabled":false'), String(targetInput))
       const updateDisabled = await js(`
         (() => {
           const button = Array.from(document.querySelectorAll('.drd-toolbar button'))

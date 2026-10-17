@@ -910,6 +910,47 @@ const configured = { ...localInstance, updateCommand: 'echo probe {version}' }
 const planConfigured = updateMod.resolveUpdatePlan(configured, 'D:/dsh/lib/bin.js', '9.9.9')
 check('显式配置生效', planConfigured.ok && planConfigured.command === 'echo probe 9.9.9', String(planConfigured.command))
 
+// ── 更新目标：默认跟桌面版同版本，而不是 npm 的 latest 标签 ──
+// 真实故障：桌面版 0.2.1-rc.2、npm latest 还是 0.2.0-rc.2，写死 @latest 的「更新」只是把同一个
+// 版本原地重装 76 秒，版本号纹丝不动 —— 用户看到的就是"无法更新"。
+check('isConcreteVersion 认具体版本', updateMod.isConcreteVersion('0.2.1-rc.2') === true)
+check('isConcreteVersion 认正式版', updateMod.isConcreteVersion('1.2.3') === true)
+check('isConcreteVersion 不认 dist-tag', updateMod.isConcreteVersion('latest') === false)
+check('compareVersions 相等', updateMod.compareVersions('0.2.0-rc.2', '0.2.0-rc.2') === 0)
+check('compareVersions rc 大于 alpha', updateMod.compareVersions('0.2.1-rc.2', '0.2.1-alpha.5') === 1)
+check('compareVersions 0.2.1-rc.2 > 0.2.0-rc.2', updateMod.compareVersions('0.2.1-rc.2', '0.2.0-rc.2') === 1)
+check('compareVersions 正式版大于同号 rc', updateMod.compareVersions('1.0.0', '1.0.0-rc.1') === 1)
+check('compareVersions 认不出返回 undefined', updateMod.compareVersions('next', '1.0.0') === undefined)
+
+const targetDefault = updateMod.decideUpdateTarget({ current: '0.2.0-rc.2', host: '0.2.1-rc.2' })
+check('默认目标是桌面版版本', targetDefault.target === '0.2.1-rc.2', targetDefault.target)
+check('默认目标来源标为 host', targetDefault.source === 'host')
+check('默认目标不跳过', targetDefault.skip === undefined, String(targetDefault.skip))
+
+const targetSame = updateMod.decideUpdateTarget({ current: '0.2.1-rc.2', host: '0.2.1-rc.2' })
+check('已经同版本 → 跳过并说明原因', targetSame.skip === 'same' && targetSame.reason.includes('无需更新'), targetSame.reason)
+
+const targetNewer = updateMod.decideUpdateTarget({ current: '0.3.0', host: '0.2.1-rc.2' })
+check('实例比桌面版新 → 跳过（不退版）', targetNewer.skip === 'newer', targetNewer.reason)
+check('并提示怎么显式降级', targetNewer.reason.includes('0.2.1-rc.2'))
+
+const targetExplicit = updateMod.decideUpdateTarget({ requested: 'next', current: '0.2.0-rc.2', host: '0.2.1-rc.2' })
+check('显式 dist-tag 优先于桌面版', targetExplicit.target === 'next' && targetExplicit.source === 'explicit')
+check('显式 dist-tag 不跳过', targetExplicit.skip === undefined)
+
+const targetExplicitSame = updateMod.decideUpdateTarget({ requested: '0.2.0-rc.2', current: '0.2.0-rc.2' })
+check('显式指定当前版本 → 跳过', targetExplicitSame.skip === 'same', targetExplicitSame.reason)
+
+const targetNoHost = updateMod.decideUpdateTarget({ current: '0.2.0-rc.2' })
+check('拿不到桌面版版本 → 退回 latest', targetNoHost.target === 'latest' && targetNoHost.source === 'latest')
+
+check(
+  '默认目标能渲染成只装桌面版那一版',
+  updateMod.resolveUpdatePlan(wslInstance, 'D:/dsh/lib/bin.js', targetDefault.target).command ===
+    'npm i -g @deepseek-ai/dsh@0.2.1-rc.2',
+  String(updateMod.resolveUpdatePlan(wslInstance, 'D:/dsh/lib/bin.js', targetDefault.target).command),
+)
+
 // 接口层：用假 api 走一遍真实 handler
 const lifecycleCalls = []
 const handler8 = createControlHandler({

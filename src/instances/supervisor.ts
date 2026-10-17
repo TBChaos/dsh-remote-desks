@@ -13,7 +13,7 @@ import { decideAttach } from './attach.js'
 import { exchangeSession, findReadyUrl, type SessionExchange } from './readiness.js'
 import { preflight, type PreflightCheck } from './preflight.js'
 import { POSIX_SHELL_PREFIX, planFor, wslShellArgv } from './spec.js'
-import { parseVersion, resolveUpdatePlan, type VersionProbe } from './update.js'
+import { decideUpdateTarget, parseVersion, resolveUpdatePlan, type VersionProbe } from './update.js'
 import {
   instanceById,
   labelOf,
@@ -236,9 +236,13 @@ export class InstanceSupervisor {
    *
    * 三条硬规矩：实例必须已停止（避免半个进程换版本）；不猜本机实例的安装方式（没配
    * updateCommand 就明说）；桌面版内置运行时（app.asar）拒绝更新并说明该走应用更新。
+   *
+   * **目标**：`target` 省略时默认跟**桌面版**同版本（不是 npm 的 `latest` 标签——实测两者
+   * 会不一样，写死 latest 只会原地重装、版本纹丝不动，用户看到的就是"无法更新"）；
+   * 已经是目标版本（或比它新）就不跑命令，直接回报"无需更新"。
    */
   async update(id: string, target?: string): Promise<UpdateOutcome> {
-    return await this.applyUpdate(id, target ?? 'latest', 'update')
+    return await this.applyUpdate(id, target, 'update')
   }
 
   /** 用最近一次更新记下的旧版本再跑一遍同一条命令。 */
@@ -253,7 +257,7 @@ export class InstanceSupervisor {
 
   private async applyUpdate(
     id: string,
-    version: string,
+    requested: string | undefined,
     kind: 'update' | 'rollback',
   ): Promise<UpdateOutcome> {
     const instance = instanceById(this.config, id)
@@ -267,18 +271,59 @@ export class InstanceSupervisor {
       throw new Error('这个实例吸附的是宿主自身（桌面版内置运行时），它的版本跟着桌面应用走，不能用 npm 更新')
     }
 
-    const plan = resolveUpdatePlan(instance, this.localEntry(instance), version)
-    if (!plan.ok || plan.command === undefined) throw new Error(plan.reason ?? '这个实例不支持更新')
-    if (kind === 'rollback' && !plan.versioned) {
-      throw new Error('updateCommand 里没有 {version} 占位符，无法指定回滚到哪个版本')
-    }
-
     runtime.busy = true
     try {
       const before = await this.probeVersion(instance, runtime)
       if (before.ok && before.version !== undefined) runtime.version = before.version
       const label = kind === 'update' ? '更新' : '回滚'
-      this.append(runtime, `${label}：${plan.command}（当前版本 ${before.version ?? '未知'}）`)
+
+      // 目标：显式指定优先；否则默认跟桌面版同版本（不是 npm 的 latest 标签——两者可能不一样）。
+      const decision =
+        kind === 'rollback'
+          ? { target: requested ?? '', source: 'explicit' as const, reason: `回滚到 ${requested ?? ''}` }
+          : decideUpdateTarget({
+              ...(requested === undefined ? {} : { requested }),
+              ...(before.version === undefined ? {} : { current: before.version }),
+              ...(this.deps.hostVersion?.() === undefined ? {} : { host: this.deps.hostVersion?.() as string }),
+            })
+
+      const plan = resolveUpdatePlan(instance, this.localEntry(instance), decision.target)
+      if (!plan.ok || plan.command === undefined) throw new Error(plan.reason ?? '这个实例不支持更新')
+      if (kind === 'rollback' && !plan.versioned) {
+        throw new Error('updateCommand 里没有 {version} 占位符，无法指定回滚到哪个版本')
+      }
+
+      // 已经是目标版本（或比它新）：**不跑命令**。以前这里会老老实实跑一遍 npm，
+      // 装完还是同一个版本——用户看到的就是"更新了但没变化，所以是坏的"。
+      if (decision.skip !== undefined) {
+        const after = before
+        const detail = `${decision.reason}`
+        const record: UpdateRecord = {
+          from: before.version,
+          to: after.version,
+          command: '（未执行）',
+          at: Date.now(),
+          ok: true,
+          detail,
+          kind,
+        }
+        runtime.lastUpdate = record
+        this.append(runtime, `${label}跳过：${detail}`)
+        return {
+          id,
+          ok: true,
+          kind,
+          target: decision.target,
+          skipped: true,
+          command: '（未执行）',
+          before,
+          after,
+          record,
+          rollbackable: false,
+        }
+      }
+
+      this.append(runtime, `${label}：${plan.command}（当前版本 ${before.version ?? '未知'}；${decision.reason}）`)
 
       const result = await this.runCommand(instance, runtime, plan.command, UPDATE_TIMEOUT_MS)
       for (const line of tailLines(result.stdout)) this.append(runtime, line)
@@ -286,11 +331,15 @@ export class InstanceSupervisor {
 
       const after = await this.probeVersion(instance, runtime)
       const ok = result.code === 0
+      const changed = before.version !== after.version
       const detail =
         result.code === null
           ? `${label}超时，已终止`
           : ok
-            ? `${label}命令以 0 退出（版本 ${before.version ?? '未知'} → ${after.version ?? '未知'}）`
+            ? changed
+              ? `${label}命令以 0 退出（版本 ${before.version ?? '未知'} → ${after.version ?? '未知'}）`
+              : `${label}命令以 0 退出，但版本没变（仍是 ${after.version ?? '未知'}）——目标 ${decision.target} ` +
+                '可能就是这个版本，或远端装的是另一份 dsh'
             : `${label}命令以 ${String(result.code)} 退出`
 
       const record: UpdateRecord = {
@@ -310,6 +359,8 @@ export class InstanceSupervisor {
         id,
         ok,
         kind,
+        target: decision.target,
+        skipped: false,
         command: plan.command,
         before,
         after,

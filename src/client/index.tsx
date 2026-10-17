@@ -96,6 +96,10 @@ const CSS = `
 .drd-btn:hover { border-color: var(--dsw-alias-border-l2, currentColor); }
 .drd-btn:disabled { opacity: .45; cursor: default; }
 .drd-btn[data-primary="true"] { border-color: var(--dsw-alias-brand-primary, currentColor); }
+.drd-input { font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 8px;
+  color: var(--dsw-alias-label-primary, inherit); background: var(--dsw-alias-bg-layer-1, transparent);
+  border: 1px solid var(--dsw-alias-border-l1, currentColor); }
+.drd-input:disabled { opacity: .45; }
 .drd-body { flex: 1; min-height: 0; display: flex; }
 .drd-list { width: 232px; flex: none; overflow: auto; border-right: 1px solid var(--dsw-alias-border-l1, currentColor); padding: 10px; }
 .drd-item { width: 100%; text-align: left; font: inherit; cursor: pointer; display: block; padding: 8px 10px; border-radius: 8px; border: 1px solid transparent; background: transparent; color: inherit; margin-bottom: 4px; }
@@ -620,6 +624,8 @@ export function InstanceToolbar({
   onCheck,
   onUpdate,
   onRollback,
+  updateTarget,
+  onUpdateTargetChange,
 }: {
   instance: InstanceSnapshot
   busy: string | undefined
@@ -628,6 +634,9 @@ export function InstanceToolbar({
   onCheck: (id: string) => void
   onUpdate: (id: string) => void
   onRollback: (id: string) => void
+  /** 「更新到」输入框里的内容（留空 = 跟桌面版同版本）。 */
+  updateTarget: string
+  onUpdateTargetChange: (value: string) => void
 }): ReactNode {
   const stopped = instance.phase === 'stopped'
   const last = instance.lastUpdate
@@ -667,10 +676,22 @@ export function InstanceToolbar({
         >
           停止
         </button>
+        {/* 「更新到」：留空 = 跟桌面版同版本（推荐的默认）；也可以填 0.2.1-rc.2 / next / alpha。
+            运行中也能先打字（按钮要等停止了才可点），所以这里只在忙的时候禁用。 */}
+        <input
+          type="text"
+          className="drd-input"
+          value={updateTarget}
+          disabled={busy !== undefined}
+          placeholder="更新到（留空=桌面版）"
+          title="填版本号（如 0.2.1-rc.2）或 dist-tag（latest / next / alpha）；留空表示跟桌面版同版本"
+          onChange={(event) => onUpdateTargetChange(event.currentTarget.value)}
+          style={{ width: 132 }}
+        />
         <button
           type="button"
           className="drd-btn"
-          title="升级这个实例上安装的 DSH（需先停止）"
+          title="升级这个实例上安装的 DSH（需先停止）。留空时更新到与桌面版同版本"
           disabled={!stopped || busy !== undefined}
           onClick={() => onUpdate(instance.id)}
         >
@@ -725,7 +746,11 @@ export interface PanelActions {
   refresh(): void
   select(id: string | undefined): void
   lifecycle(id: string, action: 'start' | 'stop' | 'restart'): Promise<{ ok: boolean; message?: string }>
-  version(id: string, action: 'update' | 'rollback'): Promise<{ ok: boolean; message?: string }>
+  version(
+    id: string,
+    action: 'update' | 'rollback',
+    target?: string,
+  ): Promise<{ ok: boolean; message?: string; detail?: string }>
 }
 
 export interface PanelViewProps extends PanelServices {
@@ -746,6 +771,8 @@ export function PanelView(props: PanelViewProps): ReactNode {
   const loading = store.instances.phase === 'loading'
   const [busy, setBusy] = useState<string | undefined>(undefined)
   const [checks, setChecks] = useState<CheckState | undefined>(undefined)
+  /** 更新 / 回滚的一句话结果（成功时也摆出来，别让人猜发生了什么）。 */
+  const [notice, setNotice] = useState<string | undefined>(undefined)
   const [diagnostics, setDiagnostics] = useState<string | undefined>(undefined)
   const [diagnosticsNote, setDiagnosticsNote] = useState<string>('')
   /** 镜像区当前那行说明（哪种容器/降级原因）——诊断文本里最有用的一行，通过回调带上来。 */
@@ -840,13 +867,22 @@ export function PanelView(props: PanelViewProps): ReactNode {
     }
   }
 
-  /** 更新 / 回滚：都是 POST 一个动作，结束后刷新列表让版本与结果立刻可见。 */
+  /**
+   * 更新 / 回滚：都是 POST 一个动作，结束后刷新列表让版本与结果立刻可见。
+   *
+   * 「更新」会把输入框里的目标一起送过去：留空 = 跟桌面版同版本（宿主算的默认），
+   * 填 `next` / `0.2.1-rc.2` 这种就按你写的来。
+   */
   const runLifecycle = async (id: string, action: 'update' | 'rollback'): Promise<void> => {
     setBusy(`${id}:${action}`)
     setChecks(undefined)
+    setNotice(undefined)
     try {
-      const result = await actions.version(id, action)
+      const target = action === 'update' ? (updateTargets[id] ?? '').trim() : undefined
+      const result = await actions.version(id, action, target === '' ? undefined : target)
       if (!result.ok) setChecks({ phase: 'error', message: result.message ?? '操作失败' })
+      // 成功时把一句话结果摆出来：「更新到 0.2.1-rc.2」或「已是最新，无需更新」都在这条里。
+      else setNotice(result.detail ?? (action === 'update' ? '更新完成' : '回滚完成'))
     } finally {
       setBusy(undefined)
     }
@@ -868,6 +904,8 @@ export function PanelView(props: PanelViewProps): ReactNode {
   // 「重载」：换一个 key 把载体整个重挂一次（镜像卡住、或想重新走一遍票据时最省事）。
   // 按实例记：重载的是当前这台，别把后台保活的那几台也掀了。
   const [reloads, setReloads] = useState<Record<string, number>>({})
+  /** 「更新到」输入框：留空 = 跟桌面版同版本（host 半的默认）。 */
+  const [updateTargets, setUpdateTargets] = useState<Record<string, string>>({})
   /**
    * 最近看过的几台，仍在运行的**保持挂载**（隐藏起来），切回来就是瞬间的事。
    *
@@ -1099,6 +1137,10 @@ export function PanelView(props: PanelViewProps): ReactNode {
                 instance={active}
                 busy={busy}
                 mirrorEntryUrl={open}
+                updateTarget={updateTargets[active.id] ?? ''}
+                onUpdateTargetChange={(value) =>
+                  setUpdateTargets((current) => ({ ...current, [active.id]: value }))
+                }
                 onAction={(id, action) => void run(id, action)}
                 onUpdate={(id) => void runLifecycle(id, 'update')}
                 onRollback={(id) => void runLifecycle(id, 'rollback')}
@@ -1113,6 +1155,15 @@ export function PanelView(props: PanelViewProps): ReactNode {
                   })
                 }}
               />
+
+              {notice === undefined ? null : (
+                <div className="drd-meta" style={{ padding: '6px 16px', display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span>{notice}</span>
+                  <button type="button" className="drd-btn" onClick={() => setNotice(undefined)}>
+                    知道了
+                  </button>
+                </div>
+              )}
 
               {checks === undefined ? null : <CheckList state={checks} onClose={() => setChecks(undefined)} />}
 
@@ -1148,7 +1199,14 @@ function Panel(services: PanelServices): ReactNode {
     refresh: () => void refreshWorkbench(),
     select: (id) => selectInstance(id),
     lifecycle: (id, action) => lifecycleAction(id, action),
-    version: (id, action) => versionAction(id, action),
+    version: async (id, action, target) => {
+      const result = await versionAction(id, action, target)
+      return {
+        ok: result.ok,
+        ...(result.message === undefined ? {} : { message: result.message }),
+        ...(result.detail === undefined ? {} : { detail: result.detail }),
+      }
+    },
   }
   return <PanelView {...services} store={store} actions={actions} />
 }

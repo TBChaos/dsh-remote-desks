@@ -75,3 +75,118 @@ export function resolveUpdatePlan(
   }
   return { ok: true, command: `npm i -g @deepseek-ai/dsh@${version}`, versioned: true }
 }
+
+/** 版本号的形状判定：`1.2.3`、`1.2.3-rc.2` 这种才算"具体版本"，其它一律当 dist-tag。 */
+export function isConcreteVersion(value: string): boolean {
+  return /^\d+\.\d+\.\d+(?:-[\w.]+)?$/.test(value.trim())
+}
+
+/** 比较两个具体版本；只比 `x.y.z` 与 prerelease 段，返回 -1 / 0 / 1。认不出就返回 undefined。 */
+export function compareVersions(a: string, b: string): number | undefined {
+  const parse = (value: string): { core: number[]; pre: string[] } | undefined => {
+    const match = /^(\d+)\.(\d+)\.(\d+)(?:-([\w.]+))?$/.exec(value.trim())
+    if (match === null) return undefined
+    return {
+      core: [Number(match[1]), Number(match[2]), Number(match[3])],
+      pre: match[4] === undefined ? [] : match[4].split('.'),
+    }
+  }
+  const left = parse(a)
+  const right = parse(b)
+  if (left === undefined || right === undefined) return undefined
+  for (let index = 0; index < 3; index += 1) {
+    const l = left.core[index] ?? 0
+    const r = right.core[index] ?? 0
+    if (l !== r) return l < r ? -1 : 1
+  }
+  // 有 prerelease 的版本小于同号的正式版（semver 规则）。
+  if (left.pre.length === 0 && right.pre.length === 0) return 0
+  if (left.pre.length === 0) return 1
+  if (right.pre.length === 0) return -1
+  const length = Math.max(left.pre.length, right.pre.length)
+  for (let index = 0; index < length; index += 1) {
+    const l = left.pre[index]
+    const r = right.pre[index]
+    if (l === undefined) return -1
+    if (r === undefined) return 1
+    const ln = Number(l)
+    const rn = Number(r)
+    const bothNumeric = Number.isSafeInteger(ln) && Number.isSafeInteger(rn) && !l.startsWith('-') && !r.startsWith('-')
+    if (bothNumeric && ln !== rn) return ln < rn ? -1 : 1
+    if (!bothNumeric && l !== r) return l < r ? -1 : 1
+  }
+  return 0
+}
+
+/**
+ * 一次「更新」到底该拿什么当目标。
+ *
+ * 这块是被真实故障逼出来的：以前默认写死 `@latest`，而 npm 的 `latest` 标签未必跟着桌面版走
+ * （实测桌面版 0.2.1-rc.2、`latest` 还是 0.2.0-rc.2）——于是点「更新」只是把同一个版本
+ * 原地重装 76 秒，版本号纹丝不动，用户看到的就是"无法更新"。
+ */
+export type UpdateTargetSource = 'explicit' | 'host' | 'latest'
+
+export interface UpdateTargetDecision {
+  /** 真正拿去跑命令的目标：具体版本或 dist-tag。 */
+  target: string
+  source: UpdateTargetSource
+  /**
+   * 不用跑命令的原因：
+   * - `same`：已经就是目标版本；
+   * - `newer`：实例已经比目标版本还新（默认目标时才会出现，避免"更新"变降级）。
+   */
+  skip?: 'same' | 'newer'
+  /** 给人看的一句话（写进日志与面板）。 */
+  reason: string
+}
+
+export function decideUpdateTarget(input: {
+  /** 用户显式指定的版本 / dist-tag；空表示"用默认"。 */
+  requested?: string
+  /** 实例当前版本（探测得到才有）。 */
+  current?: string
+  /** 桌面版自己跑的版本（宿主版本）。 */
+  host?: string
+}): UpdateTargetDecision {
+  const requested = input.requested?.trim()
+  if (requested !== undefined && requested !== '') {
+    const decision: UpdateTargetDecision = {
+      target: requested,
+      source: 'explicit',
+      reason: `按你指定的目标 ${requested}`,
+    }
+    if (input.current !== undefined && isConcreteVersion(requested)) {
+      const order = compareVersions(input.current, requested)
+      if (order === 0) return { ...decision, skip: 'same', reason: `已经是指定版本 ${requested}，无需更新` }
+      if (order !== undefined && order > 0) {
+        return {
+          ...decision,
+          skip: 'newer',
+          reason: `实例已经是 ${input.current}，比指定目标 ${requested} 新；要降级请显式指定更旧的版本`,
+        }
+      }
+    }
+    return decision
+  }
+
+  const host = input.host?.trim()
+  if (host === undefined || host === '') {
+    return { target: 'latest', source: 'latest', reason: '拿不到桌面版版本，退回 npm 的 latest 标签' }
+  }
+  if (input.current !== undefined && isConcreteVersion(host)) {
+    const order = compareVersions(input.current, host)
+    if (order === 0) {
+      return { target: host, source: 'host', skip: 'same', reason: `已经和桌面版同版本（${host}），无需更新` }
+    }
+    if (order !== undefined && order > 0) {
+      return {
+        target: host,
+        source: 'host',
+        skip: 'newer',
+        reason: `实例已经是 ${input.current}，比桌面版（${host}）还新；要降到桌面版版本请显式指定 ${host}`,
+      }
+    }
+  }
+  return { target: host, source: 'host', reason: `默认跟桌面版同版本（${host}）` }
+}

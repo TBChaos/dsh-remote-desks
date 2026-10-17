@@ -180,16 +180,20 @@ function installProfile() {
  * 用 node:http 而不是 fetch —— fetch 会把 `host` 当禁止头名丢掉，伪造不出来。
  * 这里要验的正是 Host 校验，所以必须能自己写 Host。
  */
-function httpRequestOnce(url, { method = 'GET', headers = {} } = {}) {
+function httpRequestOnce(url, { method = 'GET', headers = {}, body } = {}) {
   return new Promise((resolvePromise, rejectPromise) => {
     const parsed = new URL(url)
+    const payload = body === undefined ? undefined : JSON.stringify(body)
     const request = httpRequest(
       {
         hostname: parsed.hostname,
         port: parsed.port,
         path: `${parsed.pathname}${parsed.search}`,
         method,
-        headers,
+        headers:
+          payload === undefined
+            ? headers
+            : { ...headers, 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) },
       },
       (response) => {
         let text = ''
@@ -203,12 +207,18 @@ function httpRequestOnce(url, { method = 'GET', headers = {} } = {}) {
       },
     )
     request.on('error', rejectPromise)
-    request.end()
+    request.end(payload)
   })
 }
 
 const get = (url, headers) => httpRequestOnce(url, { headers })
-const post = (url, headers) => httpRequestOnce(url, { method: 'POST', headers })
+/** POST；`body` 给了就以 JSON 送（更新的 `{ target }` 用它）。 */
+const post = (url, { cookie, headers = {}, body } = {}) =>
+  httpRequestOnce(url, {
+    method: 'POST',
+    ...(cookie === undefined ? {} : { headers: { ...headers, cookie } }),
+    ...(body === undefined ? {} : { body }),
+  })
 const cookieOf = (headers) => (headers['set-cookie'] ?? []).map((value) => value.split(';')[0]).join('; ')
 
 async function awaitPhase(base, cookie, id, phase, timeoutMs = 150_000) {
@@ -645,19 +655,49 @@ async function main() {
     check('实例日志可读', (JSON.parse(logs.text)?.lines ?? []).length > 0)
 
     /* ── 更新 / 回滚（用无害命令验机制） ── */
-    console.log('\n[更新] 版本探测 → 更新 → 回滚')
+    console.log('\n[更新] 版本探测 → 指定目标 → 已是最新跳过 → 默认目标 → 回滚')
     const versionResponse = await get(`${base}/remote-desks/api/instances/upd-local/version`, { cookie })
     check('GET version → 200', versionResponse.status === 200, String(versionResponse.status))
     const versionBody = JSON.parse(versionResponse.text)
     check('探测到了版本', versionBody.ok === true && typeof versionBody.version === 'string', `${String(versionBody.version)}（来源 ${String(versionBody.source)}）`)
+    const currentVersion = String(versionBody.version)
 
-    const updated = await post(`${base}/remote-desks/api/instances/upd-local/update`, { cookie })
-    check('POST update → 200', updated.status === 200, String(updated.status))
+    // 1) 显式目标：按你给的 dist-tag 渲染，必须真的执行。
+    const updated = await post(`${base}/remote-desks/api/instances/upd-local/update`, { cookie, body: { target: 'next' } })
+    check('POST update（指定 next）→ 200', updated.status === 200, String(updated.status))
     const updateBody = JSON.parse(updated.text)
     check('更新命令以 0 退出', updateBody.ok === true, String(updateBody.record?.detail))
+    check('更新没有走"跳过"分支', updateBody.skipped === false, String(updateBody.skipped))
     check('记录里有 from / to', updateBody.record?.from !== undefined && updateBody.record?.to !== undefined, `${String(updateBody.record?.from)} → ${String(updateBody.record?.to)}`)
     check('可回滚标记为真', updateBody.rollbackable === true, String(updateBody.rollbackable))
-    check('命令确实按 latest 渲染', updateBody.command === 'echo update-probe latest', String(updateBody.command))
+    check('显式 dist-tag 原样渲染', updateBody.command === 'echo update-probe next', String(updateBody.command))
+    check('结果里带上了目标', updateBody.target === 'next', String(updateBody.target))
+
+    // 2) 目标就是当前版本：**不跑命令**，直接回报"无需更新"。
+    //    以前这里会老老实实跑一遍 npm，装完还是同一个版本 —— 用户看到的就是"更新了但没变化"。
+    const skipped = await post(`${base}/remote-desks/api/instances/upd-local/update`, { cookie, body: { target: currentVersion } })
+    const skipBody = JSON.parse(skipped.text)
+    check('已是最新 → 200', skipped.status === 200, String(skipped.status))
+    check('已是最新 → skipped=true', skipBody.skipped === true, String(skipBody.skipped))
+    check('已是最新 → 不执行命令', skipBody.command === '（未执行）', String(skipBody.command))
+    check('已是最新 → 说明里写了"无需更新"', String(skipBody.record?.detail ?? '').includes('无需更新'), String(skipBody.record?.detail))
+
+    // 3) 不给目标：默认跟桌面版同版本（不是 npm 的 latest 标签）。
+    const defaultTarget = await post(`${base}/remote-desks/api/instances/upd-local/update`, { cookie })
+    const defaultBody = JSON.parse(defaultTarget.text)
+    check('默认目标 → 200', defaultTarget.status === 200, String(defaultTarget.status))
+    check(
+      '默认目标是具体版本，不是 latest',
+      /^\d+\.\d+\.\d+/.test(String(defaultBody.target)),
+      String(defaultBody.target),
+    )
+    check(
+      '默认目标要么跳过、要么按该版本渲染命令',
+      defaultBody.skipped === true
+        ? defaultBody.command === '（未执行）'
+        : defaultBody.command === `echo update-probe ${String(defaultBody.target)}`,
+      `${String(defaultBody.command)}（skipped=${String(defaultBody.skipped)}）`,
+    )
 
     const afterUpdate = await get(`${base}/remote-desks/api/instances/upd-local`, { cookie })
     const afterUpdateBody = JSON.parse(afterUpdate.text)
@@ -665,14 +705,19 @@ async function main() {
     check('快照带上了更新记录', afterUpdateBody.lastUpdate?.kind === 'update', String(afterUpdateBody.lastUpdate?.kind))
     check(
       '日志里有更新命令的输出',
-      (afterUpdateBody.logs?.lines ?? []).some((line) => line.includes('update-probe latest')),
+      (afterUpdateBody.logs?.lines ?? []).some((line) => line.includes('update-probe next')),
       (afterUpdateBody.logs?.lines ?? []).slice(-3).join(' | '),
     )
 
+    // 回滚用的是"最近一次成功更新记下的 from"，无论之后有没有跳过。
     const rolledBack = await post(`${base}/remote-desks/api/instances/upd-local/rollback`, { cookie })
     check('POST rollback → 200', rolledBack.status === 200, String(rolledBack.status))
     const rollbackBody = JSON.parse(rolledBack.text)
-    check('回滚命令带上了旧版本', String(rollbackBody.command).includes(String(updateBody.record.from)), String(rollbackBody.command))
+    check(
+      '回滚命令带上了旧版本',
+      String(rollbackBody.command) === `echo update-probe ${currentVersion}`,
+      `${String(rollbackBody.command)}（期望 ${currentVersion}）`,
+    )
     check('回滚记录 kind 正确', rollbackBody.record?.kind === 'rollback', String(rollbackBody.record?.kind))
 
     const immutable = await post(`${base}/remote-desks/api/instances/upd-immutable/update`, { cookie })
@@ -700,14 +745,15 @@ async function main() {
       ...(wslDistro === '' ? [] : [['upd-wsl', 'WSL']]),
       ...(sshMode ? [['upd-ssh', 'SSH']] : []),
     ]) {
-      const updated2 = await post(`${base}/remote-desks/api/instances/${id}/update`, { cookie })
+      // 显式给目标，这样"执行 / 渲染"两条断言都是确定的（不依赖桌面版版本号）。
+      const updated2 = await post(`${base}/remote-desks/api/instances/${id}/update`, { cookie, body: { target: 'next' } })
       const body2 = JSON.parse(updated2.text)
       check(`${label} 通道更新成功`, updated2.status === 200 && body2.ok === true, `${String(body2.record?.detail)}`)
-      check(`${label} 更新命令按 latest 渲染`, body2.command === 'echo update-probe latest', String(body2.command))
+      check(`${label} 通道按指定目标渲染`, body2.command === 'echo update-probe next', String(body2.command))
       const snap = JSON.parse((await get(`${base}/remote-desks/api/instances/${id}`, { cookie })).text)
       check(
         `${label} 通道日志里有命令输出`,
-        (snap.logs?.lines ?? []).some((line) => line.includes('update-probe latest')),
+        (snap.logs?.lines ?? []).some((line) => line.includes('update-probe next')),
         (snap.logs?.lines ?? []).slice(-2).join(' | '),
       )
       const back2 = await post(`${base}/remote-desks/api/instances/${id}/rollback`, { cookie })

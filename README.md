@@ -199,14 +199,24 @@ dsh plugin --profile desktop add D:\code\dsh-remote-desks
 ### 更新（升级那个实例上的 DSH）
 
 实例**已停止**时，工具栏的「更新」可用：先读出当前版本 → 跑更新命令 → 再读一次版本并记录
-结果（面板显示「上次更新：0.2.0-rc.1 → 0.3.0」）。想退回就点「回滚」，它用记下来的旧版本
+结果（面板显示「上次更新：0.2.0-rc.2 → 0.2.1-rc.2」）。想退回就点「回滚」，它用记下来的旧版本
 再跑同一条命令。
+
+**默认更新到「跟桌面版同版本」**，不是 npm 的 `latest` 标签——这两个会不一样。工具栏那个
+「更新到」输入框可以改：填版本号（`0.2.1-rc.2`）或 dist-tag（`latest` / `next` / `alpha`），
+留空就是跟桌面版一致。
+
+> 为什么不是 `latest`：npm 的 dist-tag 由发布方维护，实测桌面版已经跑到 `0.2.1-rc.2`、
+> 而 `latest` 还停在 `0.2.0-rc.2`。以前默认写死 `@latest`，点「更新」等于把同一个版本
+> 原地重装 76 秒，版本号纹丝不动——看起来就是"更新不了"。
+> 现在：目标是具体版本且**已经就是它**（或实例比它还新）时，命令根本不跑，直接回
+> 「已经和桌面版同版本（0.2.1-rc.2），无需更新」。
 
 默认命令按实例类型给：
 
 | 实例类型 | 默认更新命令 |
 |---|---|
-| `wsl` / `ssh` | `npm i -g @deepseek-ai/dsh@{version}`（`{version}` 默认 `latest`，回滚时换成旧版本） |
+| `wsl` / `ssh` | `npm i -g @deepseek-ai/dsh@{version}`（`{version}` 默认是**桌面版的版本**，回滚时换成旧版本） |
 | `local` | **没有默认值**。本机那份 DSH 可能是内置运行时、全局 npm 或自己 clone 的，猜错只会装出一份用不到的副本——请在实例上写 `updateCommand` |
 
 三条硬规矩：
@@ -215,6 +225,8 @@ dsh plugin --profile desktop add D:\code\dsh-remote-desks
 - 桌面版**自带运行时**（`app.asar` 里那份）拒绝更新，并告诉你该走桌面应用自己的更新，
   而不是假装成功。
 - 命令输出进日志抽屉（只留尾部 40 行，免得 npm 刷屏把环冲掉）；10 分钟不结束会终止。
+- 命令以 0 退出但**版本没变**时，结果会明说「版本没变」并提示原因（目标就是这个版本 /
+  远端装的是另一份 dsh），不会报成"更新成功"。
 
 想用自己的方式更新？在实例配置里写 `updateCommand`，命令里可带 `{version}` 占位符
 （带占位符才支持精确回滚）：
@@ -337,8 +349,11 @@ dsh plugin --profile desktop add <本目录路径>
 | `GET` | `/remote-desks/api/instances/:id/check` | **预检**：不启动实例，只列出缺什么（含 DSH 版本） |
 | `POST` | `/remote-desks/api/instances/:id/start\|stop\|restart` | 生命周期操作 |
 | `GET` | `/remote-desks/api/instances/:id/version` | 探测该实例的 DSH 版本（本机读 package.json，WSL/SSH 跑 `dsh -V`） |
-| `POST` | `/remote-desks/api/instances/:id/update` | **更新**：升级该实例上安装的 DSH。可选 JSON 体 `{"target":"0.3.0"}`，省略即 `latest` |
+| `POST` | `/remote-desks/api/instances/:id/update` | **更新**：升级该实例上安装的 DSH。可选 JSON 体 `{"target":"0.2.1-rc.2"}`（也收 dist-tag：`next` / `alpha` / `latest`），省略即**跟桌面版同版本** |
 | `POST` | `/remote-desks/api/instances/:id/rollback` | **回滚**到最近一次更新前的版本（要求命令里带 `{version}`） |
+
+响应是 `UpdateOutcome`：`target`（这次实际拿去的目标）、`skipped`（true 表示没跑命令——已经
+是目标版本或比它还新）、`command`、`before` / `after`（两次版本探测）、`record.detail`（一句话结果）。
 
 更新与回滚的拒绝语义（都是 409 + `message`）：实例未停止、内置运行时（`app.asar`）、
 本机实例没配 `updateCommand`、没有可回滚的记录。未知实例一律 404。
@@ -632,14 +647,20 @@ ok  再吸附后回到 running / 换了新票据 / 镜像照旧可取
 `echo update-probe {version}`——验证脚本不该动你机器上的真实安装：
 
 ```
-ok  WSL 通道探测到版本 — 0.1.5-rc.3（来源 dsh -V）
-ok  SSH 通道探测到版本 — 0.1.5-rc.3（来源 dsh -V）
-ok  WSL 通道更新成功 — 更新命令以 0 退出（版本 0.1.5-rc.3 → 0.1.5-rc.3）
-ok  SSH 通道回滚成功 — echo update-probe 0.1.5-rc.3
+ok  显式 dist-tag 原样渲染 — echo update-probe next
+ok  已是最新 → skipped=true — true
+ok  已是最新 → 不执行命令 — （未执行）
+ok  已是最新 → 说明里写了"无需更新" — 已经是指定版本 0.2.0-rc.1，无需更新
+ok  默认目标是具体版本，不是 latest — 0.2.0-rc.1
+ok  默认目标要么跳过、要么按该版本渲染命令 — （未执行）（skipped=true）
+ok  WSL 通道探测到版本 — 0.2.1-rc.2（来源 dsh -V）
+ok  WSL 通道按指定目标渲染 — echo update-probe next
+ok  WSL 通道回滚成功 — echo update-probe 0.2.0-rc.1
 ```
 
-这三条各自压着不同的代码路径：本机读 `package.json`；WSL 走 `wsl.exe` + bash（要带 nvm 前置，
+这几条各自压着不同的代码路径：本机读 `package.json`；WSL 走 `wsl.exe` + bash（要带 nvm 前置，
 否则非交互 shell 里找不到 node）；SSH 临时开一条连接、用完即收（日志里能看到"目标 SSH 连接已关闭"）。
+「已是最新 → 不执行命令」这条是这一版的回归重点：**默认目标就是桌面版版本时，不许再原地重装一遍**。
 
 **第三道 · 装进桌面版**：`dsh-remote-desks` 已装入 desktop profile，`dsh.bundle.patch` 会把
 `remote-desks` 行插进 Loader 树。桌面版是**启动型 profile**，加载新 bundle 行需要**重启一次

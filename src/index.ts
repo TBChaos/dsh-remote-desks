@@ -189,6 +189,10 @@ export function apply(ctx: RemoteDesksHostContext, config: RemoteDesksConfig): v
         }
       },
       hostSelf: () => probeHostSelf(ctx),
+      // 「更新」的默认目标：桌面版自己跑的版本。用户装这个插件就是为了让几台机器对齐同一版，
+      // 而 npm 的 `latest` 标签未必跟得上桌面版（实测桌面版 0.2.1-rc.2、latest 还是 0.2.0-rc.2，
+      // 于是「更新」只把同一个版本原地重装一遍，版本号纹丝不动 —— 看起来就是"无法更新"）。
+      hostVersion: () => probeDshRuntime().version,
       resolveCredential: async (name): Promise<string | undefined> => {
         const credentials = ctx.get('credentials') as
           | { resolve(ref: string): Promise<{ value: string } | undefined> }

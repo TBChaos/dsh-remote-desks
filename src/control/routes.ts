@@ -13,7 +13,7 @@ export interface ControlApi {
   check(id: string): Promise<unknown>
   /** 探测实例当前的 DSH 版本。 */
   version(id: string): Promise<unknown>
-  /** 升级实例上的 DSH 包；target 省略时用 latest。 */
+  /** 升级实例上的 DSH 包；target 省略时**跟桌面版同版本**（不是 npm 的 latest 标签）。 */
   update(id: string, target?: string): Promise<unknown>
   /** 回滚到最近一次更新前的版本。 */
   rollback(id: string): Promise<unknown>

@@ -313,6 +313,8 @@ export function longStatus(instance: InstanceSnapshot): string {
 export interface ActionResult {
   ok: boolean
   message?: string
+  /** 一句话结果（更新/回滚用它回报「更新到 X」或「已是最新，无需更新」）。 */
+  detail?: string
   snapshot?: InstanceSnapshot
 }
 
@@ -324,9 +326,22 @@ async function postAction(id: string, action: string, body?: unknown): Promise<A
         ? {}
         : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
     })
-    const parsed = (await response.json().catch(() => ({}))) as { message?: string }
+    const parsed = (await response.json().catch(() => ({}))) as {
+      message?: string
+      // 更新 / 回滚的响应是 UpdateOutcome：detail 在 record 里，另外还带 target / skipped。
+      record?: { detail?: string }
+      target?: string
+      skipped?: boolean
+    }
     if (!response.ok) return { ok: false, message: parsed.message ?? `HTTP ${response.status}` }
-    return { ok: true, snapshot: parsed as unknown as InstanceSnapshot }
+    const detail =
+      parsed.record?.detail ??
+      (parsed.target === undefined ? undefined : `目标 ${parsed.target}${parsed.skipped === true ? '（未执行）' : ''}`)
+    return {
+      ok: true,
+      ...(detail === undefined ? {} : { detail }),
+      snapshot: parsed as unknown as InstanceSnapshot,
+    }
   } catch (error) {
     return { ok: false, message: describe(error) }
   } finally {
@@ -341,13 +356,18 @@ export async function lifecycleAction(
   return await postAction(id, action)
 }
 
-/** 更新 / 回滚：body 里带目标版本（省略即 latest）。 */
+/**
+ * 更新 / 回滚：body 里带目标（版本号或 dist-tag）。
+ *
+ * 省略 `target` 时由宿主决定默认目标——现在是**跟桌面版同版本**，而不是 npm 的 `latest`
+ * 标签（两者会不一样，写死 latest 就会出现"更新完版本没变"）。
+ */
 export async function versionAction(
   id: string,
   action: 'update' | 'rollback',
   target?: string,
 ): Promise<ActionResult> {
-  return await postAction(id, action, target === undefined ? {} : { target })
+  return await postAction(id, action, target === undefined || target === '' ? {} : { target })
 }
 
 /**
