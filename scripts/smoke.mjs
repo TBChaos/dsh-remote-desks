@@ -750,6 +750,9 @@ const storeReady = {
   host: { phase: 'ready', value: hostReportFixture },
   instances: { phase: 'ready', value: [fixtureRunning, fixtureStopped] },
   selected: 'wsl-ubuntu',
+  // 「重载」次数与载体说明现在都在 store 里（切换器与面板读同一份）。
+  reloads: {},
+  carrierNotes: {},
 }
 /** 同一份数据、选中运行中的那条：切换器要能反映"当前这台在跑"。 */
 const storeRunning = { ...storeReady, selected: 'local-dev' }
@@ -771,7 +774,7 @@ try {
 
   const emptyPanel = renderToStaticMarkup(
     React.createElement(PanelView, {
-      store: { host: storeReady.host, instances: { phase: 'ready', value: [] } },
+      store: { host: storeReady.host, instances: { phase: 'ready', value: [] }, reloads: {}, carrierNotes: {} },
       actions: panelActions,
       layout: renderCtx.layout,
       rightbar: renderCtx.sidebarRight,
@@ -796,6 +799,8 @@ try {
           ],
         },
         selected: 'local-dev',
+        reloads: {},
+        carrierNotes: {},
       },
       actions: panelActions,
       layout: renderCtx.layout,
@@ -827,6 +832,29 @@ try {
   check('状态只写两三个字', html.includes('>运行中</span>'), html.slice(0, 400))
   check('切换器默认贴上边中间（不挡右上角的图标）', html.includes('data-corner="top-center"'), html.slice(0, 200))
   check('切换器把位置做成 CSS 变量（贴角时用得上）', html.includes('--drd-switch-x'))
+  // 原来那条右下角浮条的动作现在都长在这枚切换器上（镜像区域里一个浮层都不剩）。
+  check('切换器上有「全窗口」动作', html.includes('>全窗口</button>'), html.slice(0, 600))
+  check('切换器上有「重载」动作', html.includes('>重载</button>'))
+  check('切换器上有「管理」出口', html.includes('>管理</button>') || html.includes('>统一界面</button>'))
+  // 这个夹具的配置是 manage 形态，所以切换器上应该是"回到统一界面"的那个按钮。
+  check('切换器上的形态按钮跟着当前形态走', html.includes('>统一界面</button>'), html.slice(0, 700))
+  // 用户截图里插件上下两个"本机"：镜像出来的就是同一个应用，它会再渲染一枚切换器。
+  // 现在被嵌进 iframe 时不渲染（SSR 里没有 window，走的是"不是嵌套"的分支）。
+  const sameWindow = {}
+  check('inNestedFrame：顶层窗口不拦', realExports.inNestedFrame({ self: sameWindow, top: sameWindow }) === false)
+  check('inNestedFrame：被嵌在 iframe 里就拦', realExports.inNestedFrame({ self: {}, top: {} }) === true)
+  check('inNestedFrame：没有 window（SSR）按顶层处理', realExports.inNestedFrame(undefined) === false)
+  check(
+    'inNestedFrame：跨域读 top 抛错也算嵌在里面',
+    realExports.inNestedFrame({
+      get self() {
+        return {}
+      },
+      get top() {
+        throw new Error('Blocked a frame')
+      },
+    }) === true,
+  )
   // 顶部留空 = 跟随官方 --dsh-frame-overlay-top（桌面版 = 标题栏高度 + 20px），别写死像素。
   check('默认不写死顶部像素，跟官方浮层基线', html.includes('--drd-switch-y') === false, html.slice(0, 240))
 } catch (error) {
@@ -856,7 +884,7 @@ try {
 
   const emptyHtml = renderToStaticMarkup(
     React.createElement(SwitcherView, {
-      store: { host: { phase: 'ready', value: hostReportFixture }, instances: { phase: 'ready', value: [] } },
+      store: { host: { phase: 'ready', value: hostReportFixture }, instances: { phase: 'ready', value: [] }, reloads: {}, carrierNotes: {} },
       actions: { select: () => {} },
       services: { layout: renderCtx.layout },
     }),
@@ -1065,9 +1093,10 @@ try {
   // SSR 不跑 effect，所以镜像载体（iframe/webview）在这层看不到；这里断言"镜像区在、且铺满由 CSS 负责"，
   // 真的铺满由 verify:ui 在浏览器里量矩形。
   check('统一界面下有镜像区', html.includes('drd-stage'), html.slice(0, 240))
-  check('浮条有关键字与状态', html.includes('>本机<') && html.includes('运行中'))
-  check('浮条有「管理」出口', html.includes('>管理</button>'))
-  check('浮条有「全窗口」与「重载」', html.includes('>全窗口</button>') && html.includes('>重载</button>'))
+  // 用户明确要求：镜像区域里不要有任何我们画的浮层（左下角"内嵌框架"、右下角浮条都压住了远端界面）。
+  check('统一界面里没有浮条', html.includes('drd-float') === false, html.slice(0, 300))
+  check('统一界面里没有载体浮签', html.includes('drd-float-note') === false)
+  check('统一界面里不含切换器（它在窗口上边那条里）', html.includes('drd-switch') === false)
 
   // 未运行 → 不是把人丢进管理界面，而是给一个能直接启动的卡片。
   const stoppedHtml = renderToStaticMarkup(
@@ -1079,7 +1108,7 @@ try {
   // 配置里的默认形态：没被用户覆盖时按配置走。
   const configuredHtml = renderToStaticMarkup(
     React.createElement(PanelView, {
-      store: { host: immersiveHost, instances: { phase: 'ready', value: [fixtureRunning, fixtureStopped] }, selected: 'local-dev' },
+      store: { host: immersiveHost, instances: { phase: 'ready', value: [fixtureRunning, fixtureStopped] }, selected: 'local-dev', reloads: {}, carrierNotes: {} },
       actions: panelActions,
       layout: renderCtx.layout,
       rightbar: renderCtx.sidebarRight,

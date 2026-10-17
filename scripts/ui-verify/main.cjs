@@ -52,12 +52,43 @@ async function main() {
     // 这是正常流程的噪声，客户端那边也已经显式忽略 -3。GUEST_VIEW_MANAGER_CALL 则是
     // 模拟壳子里 guest 自己的加载报错（webview-client 那一档已把 guest 内容列为观察项）。
     if (text.includes('ERR_ABORTED') || text.includes('GUEST_VIEW_MANAGER_CALL')) return
+    // Chromium 对"preload 了但几秒内没用上"的提示：这条由应用自己的 preload 提示产生，
+    // 出现在"同一份页面被再加载一次"的场景（我们那条 iframe 回归用例就会触发），跟本插件无关。
+    if (text.includes('preloaded using link preload but not used')) return
     // 保留尾巴：Chromium 把 `(net::ERR_xxx)` 放在消息最后，截前 300 字正好把它切掉。
     if (level >= 2) consoleErrors.push(text.length > 400 ? `${text.slice(0, 140)} … ${text.slice(-220)}` : text)
   })
   wc.on('render-process-gone', (_event, details) => record('渲染进程存活', false, JSON.stringify(details)))
 
   const js = (code) => wc.executeJavaScript(code, true)
+  /**
+   * 关掉**镜像里那份应用**自己的「预览版说明」弹窗。
+   *
+   * 它在跨域 iframe 里，页面上点不到，但主进程拿得到 frame 句柄。不关掉的话每张截图都是
+   * 弹窗写真——而这几张图要说明的恰恰是"镜像里就是那台机器的完整界面"。
+   */
+  const dismissMirrorModals = async () => {
+    for (const frame of wc.mainFrame.frames) {
+      if (!/^http:\/\/127\.0\.0\.1:\d+\//.test(frame.url)) continue
+      await frame
+        .executeJavaScript(`
+          (() => {
+            const button = Array.from(document.querySelectorAll('button'))
+              .find((node) => ['继续', '我知道了', '知道了', '不再提示'].includes((node.textContent ?? '').trim()))
+            if (button === undefined) return false
+            button.click()
+            return true
+          })()
+        `)
+        .catch(() => false)
+    }
+  }
+  /** 截图前统一走一遍：关掉镜像里的首启弹窗，再等半秒让 paint 落定。 */
+  const shoot = async (name, contents) => {
+    await dismissMirrorModals()
+    await wait(700)
+    fs.writeFileSync(path.join(outDir, name), (await (contents ?? wc).capturePage()).toPNG())
+  }
   // webview 载体：宿主侧的 guest 只有主进程看得到，这里记下来供断言用。
   let guestRef
   wc.on('did-attach-webview', (_event, guest) => {
@@ -96,6 +127,22 @@ async function main() {
   // 2. 等 shell 挂载
   await waitFor('!!document.querySelector("#root") && document.querySelector("#root").children.length > 0', 30_000, 'shell 挂载')
   await wait(2500)
+
+  // 2b. 关掉应用自己的「预览版说明」弹窗：它一挡，所有截图都成了弹窗写真，
+  //     也会让后面按 innerText 做的断言读到弹窗里的字。点不到就跳过（不同版本可能没有这篇）。
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const dismissed = await js(`
+      (() => {
+        const buttons = Array.from(document.querySelectorAll('button'))
+        const target = buttons.find((node) => ['继续', '我知道了', '知道了', '不再提示'].includes((node.textContent ?? '').trim()))
+        if (target === undefined) return false
+        target.click()
+        return true
+      })()
+    `)
+    if (dismissed !== true) break
+    await wait(800)
+  }
 
   // 2c. 窗口角上的「本机 / WSL」切换下拉框。
   //     它挂在官方的 shell.overlay（帧级浮层）上，所以**还没打开我们的面板时就应该在**——
@@ -380,7 +427,7 @@ async function main() {
       String(reserve).trim() === '' && Number.parseFloat(String(barPadding)) <= 20,
       `--drd-switch-reserve=${String(reserve).trim() || '（空）'} padding-right=${String(barPadding)}`,
     )
-    fs.writeFileSync(path.join(outDir, 'panel-stopped.png'), (await wc.capturePage()).toPNG())
+    await shoot('panel-stopped.png')
   }
 
   // 4b. 一键诊断：用户不用描述现象，点一下就能把状态贴出来
@@ -564,7 +611,7 @@ async function main() {
           )
         }
       }
-      fs.writeFileSync(path.join(outDir, 'panel-running.png'), (await wc.capturePage()).toPNG())
+      await shoot('panel-running.png')
 
       // 4f. 回到统一界面：这一屏才是"和 WebUI 一样的界面和体验"——镜像铺满主区，只剩右下角一条浮条。
       const backToImmersive = await js(`
@@ -584,7 +631,7 @@ async function main() {
             const root = document.querySelector('.drd-immersive')
             if (root === null) return { immersive: false }
             const frame = root.querySelector('iframe, webview')
-            const bar = root.querySelector('.drd-float')
+            const bar = document.querySelector('.drd-switch')
             const rootRect = root.getBoundingClientRect()
             const frameRect = frame === null ? null : frame.getBoundingClientRect()
             return {
@@ -593,6 +640,7 @@ async function main() {
               root: { w: Math.round(rootRect.width), h: Math.round(rootRect.height) },
               frame: frameRect === null ? null : { w: Math.round(frameRect.width), h: Math.round(frameRect.height) },
               floatBar: bar !== null,
+              overlays: root.querySelectorAll('.drd-float, .drd-float-note').length,
               list: document.querySelector('.drd-list') !== null,
             }
           })()
@@ -606,13 +654,45 @@ async function main() {
           filled.immersive === true && fills,
           `容器 ${JSON.stringify(filled.root)}｜镜像 ${JSON.stringify(filled.frame)}`,
         )
-        record('统一界面下浮条还在', filled.floatBar === true && filled.list === false)
+        record('统一界面下切换器还在（它在窗口上边那条里，不在镜像上）', filled.floatBar === true && filled.list === false)
+        record('镜像区域里没有任何插件浮层', filled.overlays === 0, `浮层数 ${String(filled.overlays)}`)
+
+        // 4f. 镜像里不该再长出一枚切换器——镜像出来的就是同一个应用，它也会加载本插件的 bundle。
+        //     桌面版里被镜像的就是宿主自己，所以这个 bug 只在"同一份应用"里出现；这里直接把同一个
+        //     应用页面嵌进一个 iframe 来复现那条路径（同源，contentDocument 读得到）。
+        const nested = await js(`
+          (async () => {
+            const frame = document.createElement('iframe')
+            frame.style.cssText = 'position:fixed;left:-10000px;top:0;width:900px;height:600px'
+            frame.src = location.href
+            document.body.appendChild(frame)
+            await new Promise((done) => { frame.onload = done; setTimeout(done, 15000) })
+            const doc = frame.contentDocument
+            if (doc === null) { frame.remove(); return { error: 'no contentDocument' } }
+            for (let i = 0; i < 40; i += 1) {
+              if (doc.querySelector('style[data-plugin="dsh-remote-desks"]') !== null) break
+              await new Promise((resolve) => setTimeout(resolve, 500))
+            }
+            const result = {
+              loaded: doc.querySelector('style[data-plugin="dsh-remote-desks"]') !== null,
+              switches: doc.querySelectorAll('.drd-switch').length,
+            }
+            frame.remove()
+            return result
+          })()
+        `)
+        record(
+          '同一应用嵌进 iframe 时不画第二枚切换器（不再出现上下两个「本机」）',
+          nested.loaded === true && nested.switches === 0,
+          JSON.stringify(nested),
+        )
+        record('顶层窗口自己那枚还在（一个，不是零个）', (await js('document.querySelectorAll(".drd-switch").length')) === 1)
 
         // 4g.「全窗口」= 收掉官方侧栏，让这台机器的界面拿到整扇窗（官方框架上会挂 data-sidebar-collapsed）。
         const clickFloat = (label) =>
           js(`
             (() => {
-              const button = Array.from(document.querySelectorAll('.drd-float button'))
+              const button = Array.from(document.querySelectorAll('.drd-switch button'))
                 .find((node) => (node.textContent ?? '').trim() === ${JSON.stringify(label)})
               if (button === undefined) return false
               button.click()
@@ -623,12 +703,12 @@ async function main() {
         await wait(1200)
         const collapsedNow = await js('document.querySelector("[data-sidebar-collapsed]") !== null')
         record('「全窗口」把官方侧栏收成了窄条', collapseClicked === true && collapsedNow === true, `点击=${String(collapseClicked)} 收起=${String(collapsedNow)}`)
-        if (collapsedNow === true) fs.writeFileSync(path.join(outDir, 'panel-immersive-fullwindow.png'), (await wc.capturePage()).toPNG())
+        if (collapsedNow === true) await shoot('panel-immersive-fullwindow.png')
         await clickFloat('全窗口')
         await wait(1200)
         const expandedAgain = await js('document.querySelector("[data-sidebar-collapsed]") === null')
         record('再点一次能展开回来', expandedAgain === true)
-        fs.writeFileSync(path.join(outDir, 'panel-immersive.png'), (await wc.capturePage()).toPNG())
+        await shoot('panel-immersive.png')
       }
     }
   }
@@ -734,7 +814,7 @@ async function main() {
     record('切换器里能找到第二台', switched === true)
     if (switched) {
       const running2 = await waitFor(
-        `(() => { const el = document.querySelector('.drd-float'); return el !== null && el.innerText.includes('第二台') && el.innerText.includes('运行中') })()`,
+        `(() => { const el = document.querySelector('.drd-switch'); return el !== null && el.innerText.includes('第二台') && el.innerText.includes('运行中') })()`,
         150_000,
         '第二台起来并接手前台',
       )
@@ -789,7 +869,9 @@ async function main() {
         })()
       `)
       record('切过去之后两台都还挂着（保活）', kept.total >= 2 && kept.hidden >= 1 && kept.visible === 1, JSON.stringify(kept))
-      fs.writeFileSync(path.join(outDir, 'panel-two-instances.png'), (await wc.capturePage()).toPNG())
+      // 截图前等一下：帧里"有内容"不等于"已经画出来了"，刚切过去那一刻截到的常是空背景。
+      await wait(2500)
+      await shoot('panel-two-instances.png')
 
       // 切回第一台：应该是**同一帧**重新显示出来（保活生效），而不是新挂一个。
       const back = await js(`
@@ -819,10 +901,9 @@ async function main() {
         quick.ok === true && /127\.0\.0\.1:196/.test(quick.src),
         JSON.stringify(quick),
       )
-      fs.writeFileSync(path.join(outDir, 'panel-switch-back.png'), (await wc.capturePage()).toPNG())
+      await shoot('panel-switch-back.png')
     }
   }
-
   fs.writeFileSync(path.join(outDir, 'results.json'), JSON.stringify({ ...results, consoleErrors }, null, 2))
   record('控制台无报错', consoleErrors.length === 0, consoleErrors.slice(0, 2).join(' | '))
   if (expectStage === 'gone') {
@@ -836,7 +917,7 @@ async function main() {
     `)
     record('面板已让位给右栏', gone === true)
     record('右栏里出现镜像 iframe', Array.isArray(frames) && frames.length > 0, `${String((frames ?? []).length)} 个`)
-    fs.writeFileSync(path.join(outDir, 'panel-rightbar.png'), (await wc.capturePage()).toPNG())
+    await shoot('panel-rightbar.png')
   }
   win.destroy()
   app.exit(0)

@@ -96,10 +96,24 @@ export interface WorkbenchStore {
   host: FetchState<HostReport>
   /** 实例列表。 */
   instances: FetchState<InstanceSnapshot[]>
-  /** 当前选中的实例 id；面板与窗口角的切换器共用。 */
+  /** 当前选中的实例 id；面板与窗口上边的切换器共用。 */
   selected?: string
   /** 用户点过形态按钮之后的覆盖值；没点过就用配置里的默认。 */
   layoutOverride?: LayoutMode
+  /**
+   * 每个实例的「重载」次数。
+   *
+   * 放在 store 里而不是面板的局部 state：重载按钮现在长在窗口上边那枚切换器上，
+   * 面板只是读它（当载体 key 用）。两边读同一份才不会出现"点了没反应"。
+   */
+  reloads: Record<string, number>
+  /**
+   * 每个实例当前"用的是哪种载体 / 为什么降级"。
+   *
+   * 以前这句话是浮在镜像左下角的一条浮签，正好压住远端界面自己的侧栏底部——用户明确说碍事。
+   * 现在只收在 store 里：切换器把它挂成悬停提示（出问题时亮一个 `!`），管理界面照旧当正文显示。
+   */
+  carrierNotes: Record<string, string>
 }
 
 /* ── store 本体 ── */
@@ -119,6 +133,8 @@ const storedLayout = readStoredLayout()
 const INITIAL: WorkbenchStore = {
   host: { phase: 'loading' },
   instances: { phase: 'loading' },
+  reloads: {},
+  carrierNotes: {},
   ...(storedLayout === undefined ? {} : { layoutOverride: storedLayout }),
 }
 
@@ -268,6 +284,32 @@ export function setLayoutMode(mode: LayoutMode): void {
 /** 进统一界面时要不要顺手把官方侧栏收成窄条（配置项）。 */
 export function collapseSidebarPreferred(store: WorkbenchStore): boolean {
   return store.host.phase === 'ready' && store.host.value.config.layout?.collapseSidebar === true
+}
+
+/** 「重载」：把某台的镜像载体重挂一次（换 key）。次数记在 store 里，面板与切换器读同一份。 */
+export function bumpReload(id: string): void {
+  emit({ reloads: { ...state.reloads, [id]: (state.reloads[id] ?? 0) + 1 } })
+}
+
+export function reloadCountOf(store: WorkbenchStore, id: string): number {
+  return store.reloads[id] ?? 0
+}
+
+/** 记下某台当前用的载体 / 降级原因（长句只给悬停与管理界面看，不再浮在镜像上）。 */
+export function setCarrierNote(id: string, note: string): void {
+  if (state.carrierNotes[id] === note) return
+  emit({ carrierNotes: { ...state.carrierNotes, [id]: note } })
+}
+
+/**
+ * 这句载体说明是不是"出问题了"。
+ *
+ * `内嵌框架（iframe）` 只是说明用的是哪种容器，属于正常；带"降级 / 退回 / 失败 / 超时 / 空"
+ * 字样的才值得在切换器上亮一个 `!`。
+ */
+export function carrierNoteIsProblem(note: string | undefined): boolean {
+  if (note === undefined || note === '') return false
+  return /降级|退回|失败|超时|没有|空|拒绝/.test(note) && !/^内嵌框架（iframe）$/.test(note)
 }
 
 /* ── 下拉框 / 浮条上的短标签 ── */

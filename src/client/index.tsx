@@ -2,6 +2,8 @@ import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 
 
 import {
   activeInstance,
+  bumpReload,
+  carrierNoteIsProblem,
   checkInstance,
   collapseSidebarPreferred,
   describe as describeError,
@@ -10,7 +12,9 @@ import {
   lifecycleAction,
   longStatus,
   refreshWorkbench,
+  reloadCountOf,
   selectInstance,
+  setCarrierNote,
   setLayoutMode,
   shortLabel,
   shortStatus,
@@ -115,6 +119,10 @@ const CSS = `
 .drd-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .drd-toolbar { display: flex; align-items: center; gap: 8px; padding: 10px 16px; border-bottom: 1px solid var(--dsw-alias-border-l1, currentColor); flex-wrap: wrap; }
 .drd-stage { flex: 1; min-height: 0; position: relative; background: var(--dsw-alias-bg-layer-1, transparent); }
+/* 镜像 + （可选的）载体说明：竖排，说明在**上面**——放下面会溢出并压住日志抽屉。 */
+.drd-frame-host { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.drd-frame-host > .drd-stage { min-height: 0; }
+.drd-note { padding: 6px 16px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--dsw-alias-border-l1, currentColor); }
 .drd-frame { width: 100%; height: 100%; border: 0; display: block; }
 .drd-placeholder { height: 100%; display: flex; align-items: center; justify-content: center; text-align: center; padding: 24px; color: var(--dsw-alias-label-secondary, inherit); }
 .drd-card { border: 1px solid var(--dsw-alias-border-l1, currentColor); border-radius: 10px; background: var(--dsw-alias-bg-layer-1, transparent); padding: 14px 16px; margin: 14px 18px; }
@@ -135,8 +143,8 @@ const CSS = `
    位置由 useSwitcherPlacement 现算：桌面版钻进标题栏那条带子（中间是空的，谁也不挡），
    没有标题栏的纯 Web 外壳则落在官方给浮层准备的 --dsh-frame-overlay-top 上。
    -webkit-app-region: no-drag 必须有：标题栏那条带子是窗口拖动区，不声明就点不动。 */
-.drd-switch { position: fixed; z-index: 30; display: flex; align-items: center; gap: 8px; pointer-events: auto;
-  -webkit-app-region: no-drag; padding: 4px 8px; border-radius: 999px; font-size: 12px; max-width: min(60vw, 460px);
+.drd-switch { position: fixed; z-index: 30; display: flex; align-items: center; gap: 6px; pointer-events: auto;
+  -webkit-app-region: no-drag; padding: 4px 8px; border-radius: 999px; font-size: 12px; max-width: min(72vw, 620px);
   color: var(--dsw-alias-label-primary, inherit); background: var(--dsw-alias-bg-layer-1, rgba(20,22,28,.72));
   border: 1px solid var(--dsw-alias-border-l1, currentColor); box-shadow: 0 4px 14px rgba(0,0,0,.18); }
 .drd-switch[data-corner="top-center"] { left: 50%; transform: translateX(-50%); top: var(--drd-switch-y, var(--dsh-frame-overlay-top, 20px)); }
@@ -149,13 +157,17 @@ const CSS = `
 .drd-switch .drd-meta { margin-top: 0; white-space: nowrap; }
 /* 钻进标题栏带子里时更矮一点：那条带子只有几十像素高。 */
 .drd-switch[data-band="chrome"] { padding: 2px 8px; }
+/* 切换器上的动作按钮：和下拉框同一行、同一高度，别抢戏。 */
+.drd-switch .drd-btn { padding: 2px 8px; font-size: 12px; }
+.drd-switch .drd-flag { font-size: 12px; font-weight: 700; padding: 0 2px;
+  color: var(--dsw-alias-state-error-primary, #e5484d); cursor: help; }
 
 /* 切换器是浮在帧上的，会压到本面板右上角那一排按钮——所以表头自己让出这段宽度（由切换器实测后
    写进 --drd-switch-reserve）。只让表头：工具栏在它下面一行，硬让会把按钮挤成两行。
    别的面板不归我们管，靠 offsetX 默认值躲开官方那颗侧栏开关。 */
 .drd-bar { padding-right: max(18px, var(--drd-switch-reserve, 0px)); }
 
-/* ── 统一界面（immersive）：远端那套 DSH 自己的界面铺满主区，我们只剩一条很轻的浮条 ── */
+/* ── 统一界面（immersive）：远端那套 DSH 自己的界面铺满主区，我们不在镜像上画任何浮层 ── */
 .drd-immersive { position: relative; }
 .drd-immersive .drd-stage { position: absolute; inset: 0; }
 /* 保活的镜像：隐藏但没卸载，切回来立刻就是它（连 WS 都还连着）。 */
@@ -164,18 +176,6 @@ const CSS = `
 .drd-immersive .drd-placeholder { flex-direction: column; gap: 12px; }
 .drd-loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 8px;
   color: var(--dsw-alias-label-secondary, inherit); font-size: 13px; pointer-events: none; }
-.drd-float { position: absolute; right: 12px; bottom: 12px; z-index: 5; display: flex; align-items: center; gap: 8px;
-  padding: 4px 8px; border-radius: 999px; font-size: 12px; opacity: .45; transition: opacity .15s ease;
-  color: var(--dsw-alias-label-primary, inherit); background: var(--dsw-alias-bg-layer-1, rgba(20,22,28,.72));
-  border: 1px solid var(--dsw-alias-border-l1, currentColor); box-shadow: 0 4px 14px rgba(0,0,0,.18); }
-.drd-float:hover, .drd-float:focus-within { opacity: 1; }
-.drd-float .drd-name { max-width: 180px; }
-.drd-float .drd-meta { margin-top: 0; }
-.drd-float-note { position: absolute; left: 12px; bottom: 12px; z-index: 5; max-width: 46%;
-  padding: 4px 8px; border-radius: 8px; font-size: 12px; opacity: .8;
-  color: var(--dsw-alias-label-secondary, inherit); background: var(--dsw-alias-bg-layer-1, rgba(20,22,28,.72));
-  border: 1px solid var(--dsw-alias-border-l1, currentColor);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 `
 
 function ensureStyles(): void {
@@ -207,16 +207,16 @@ function MirrorStage({
   label,
   preference,
   services,
-  floatingNote,
+  showNote,
   onNote,
 }: {
   entryUrl: string
   label: string
   preference: CarrierPreference
   services: PanelServices
-  /** 统一界面下镜像铺满主区，说明那行改成左下角的浮条（不然会被裁掉）。 */
-  floatingNote?: boolean
-  /** 把当前那行说明回带出去（诊断文本要用）。 */
+  /** 是否在镜像上方显示那行载体说明（管理界面显示，统一界面里不显示——那里要全屏无打扰）。 */
+  showNote?: boolean
+  /** 把当前那行说明回带出去（诊断文本要用；统一界面下它还会被挂到切换器的悬停提示上）。 */
   onNote?: (value: string) => void
 }): ReactNode {
   const hostRef = useRef<HTMLDivElement | null>(null)
@@ -511,48 +511,45 @@ function MirrorStage({
   }
 
   return (
-    <div className="drd-stage">
-      <div ref={hostRef} style={{ width: '100%', height: '100%' }}>
-        {mode === 'iframe' ? (
-          // key 用地址：换实例/换端口时是**新的一次导航**，不是复用同一个 iframe——
-          // 复用会让旧页面的脚本继续跑在新地址上，看起来像卡住。
-          <iframe
-            key={entryUrl}
-            className="drd-frame"
-            src={entryUrl}
-            title={`${label} 的镜像`}
-            onLoad={() => setFrameReady(true)}
-            sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-downloads"
-          />
-        ) : null}
-      </div>
-      {/* 远端那套前端要下几百 KB 的 bundle 再自己挂载，这期间别留一块纯白：说清在等什么。 */}
-      {mode === 'iframe' && !frameReady ? (
-        <div className="drd-loading">
-          <span className="drd-dot" data-phase="starting" />
-          正在渲染远端界面…
+    <div className="drd-frame-host">
+      {/* 载体说明放镜像**上面**，而且只有管理界面才显示：塞在镜像下面会溢出去、
+          压住下面的日志抽屉（实测就这么叠在一起了）。统一界面里一个字都不显示。 */}
+      {showNote === true && mode !== 'pending' && note !== '' ? (
+        <div className="drd-meta drd-note">
+          <span>{note}</span>
+          {mode === 'webview' && stuck ? (
+            // 兜底出口：桌面那条路我测不到主进程那半边，万一挂上了却渲染不出来，
+            // 用户得有一键换载体的办法，而不是去改配置重启。
+            <button type="button" className="drd-btn" onClick={switchToIframe}>
+              改用内嵌框架
+            </button>
+          ) : null}
         </div>
       ) : null}
-      {mode === 'pending' ? <div className="drd-placeholder">正在打开镜像…</div> : null}
-      {mode !== 'pending' && note !== '' ? (
-        floatingNote === true ? (
-          // 统一界面：镜像铺满，说明改成左下角一条浮签，别把界面顶下去。
-          <div className="drd-float-note" title={note}>
-            {note}
+      <div className="drd-stage">
+        <div ref={hostRef} style={{ width: '100%', height: '100%' }}>
+          {mode === 'iframe' ? (
+            // key 用地址：换实例/换端口时是**新的一次导航**，不是复用同一个 iframe——
+            // 复用会让旧页面的脚本继续跑在新地址上，看起来像卡住。
+            <iframe
+              key={entryUrl}
+              className="drd-frame"
+              src={entryUrl}
+              title={`${label} 的镜像`}
+              onLoad={() => setFrameReady(true)}
+              sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-downloads"
+            />
+          ) : null}
+        </div>
+        {/* 远端那套前端要下几百 KB 的 bundle 再自己挂载，这期间别留一块纯白：说清在等什么。 */}
+        {mode === 'iframe' && !frameReady ? (
+          <div className="drd-loading">
+            <span className="drd-dot" data-phase="starting" />
+            正在渲染远端界面…
           </div>
-        ) : (
-          <div className="drd-meta" style={{ padding: '6px 16px', display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span>{note}</span>
-            {mode === 'webview' && stuck ? (
-              // 兜底出口：桌面那条路我测不到主进程那半边，万一挂上了却渲染不出来，
-              // 用户得有一键换载体的办法，而不是去改配置重启。
-              <button type="button" className="drd-btn" onClick={switchToIframe}>
-                改用内嵌框架
-              </button>
-            ) : null}
-          </div>
-        )
-      ) : null}
+        ) : null}
+        {mode === 'pending' ? <div className="drd-placeholder">正在打开镜像…</div> : null}
+      </div>
     </div>
   )
 }
@@ -901,9 +898,7 @@ export function PanelView(props: PanelViewProps): ReactNode {
   const sidebarCollapsed = (): boolean =>
     typeof document !== 'undefined' && document.querySelector('[data-sidebar-collapsed]') !== null
 
-  // 「重载」：换一个 key 把载体整个重挂一次（镜像卡住、或想重新走一遍票据时最省事）。
-  // 按实例记：重载的是当前这台，别把后台保活的那几台也掀了。
-  const [reloads, setReloads] = useState<Record<string, number>>({})
+  // 「重载」的次数记在 store 里（切换器上的按钮和这里的载体 key 读同一份，见 workbench.bumpReload）。
   /** 「更新到」输入框：留空 = 跟桌面版同版本（host 半的默认）。 */
   const [updateTargets, setUpdateTargets] = useState<Record<string, string>>({})
   /**
@@ -1005,16 +1000,17 @@ export function PanelView(props: PanelViewProps): ReactNode {
               return (
                 <div key={id} className="drd-keep" data-active={isActive} hidden={!isActive}>
                   <MirrorStage
-                    key={`${id}:${String(reloads[id] ?? 0)}`}
+                    key={`${id}:${String(reloadCountOf(store, id))}`}
                     entryUrl={entryUrl}
                     label={instance.label}
                     preference={preference}
                     services={props}
-                    floatingNote={true}
                     {...(isActive
                       ? {
                           onNote: (value: string) => {
                             carrierNoteRef.current = value
+                            // 同一份说明也给切换器（它长在窗口上边，悬停就能看到载体/降级原因）。
+                            setCarrierNote(id, value)
                           },
                         }
                       : {})}
@@ -1022,42 +1018,11 @@ export function PanelView(props: PanelViewProps): ReactNode {
                 </div>
               )
             })}
-            <div className="drd-float">
-              <span className="drd-dot" data-phase={active.phase} />
-              <span className="drd-name" title={longStatus(active)}>
-                {shortLabel(active)}
-              </span>
-              <span className="drd-meta">{shortStatus(active)}</span>
-              <button
-                type="button"
-                className="drd-btn"
-                title={sidebarCollapsed() ? '展开应用侧栏' : '收起应用侧栏，让这台机器的界面占满窗口'}
-                onClick={toggleSidebar}
-              >
-                全窗口
-              </button>
-              <button
-                type="button"
-                className="drd-btn"
-                title="把这台机器的镜像载体重新挂一遍（卡住、或想重走一遍票据时用）"
-                onClick={() =>
-                  setReloads((current) => ({ ...current, [active.id]: (current[active.id] ?? 0) + 1 }))
-                }
-              >
-                重载
-              </button>
-              <button
-                type="button"
-                className="drd-btn"
-                title="显示实例列表、工具栏与日志"
-                onClick={() => setLayoutMode('manage')}
-              >
-                管理
-              </button>
-            </div>
+            {/* 这里原来有一条右下角浮条（名字/状态/全窗口/重载/管理）——用户说它压住了远端界面
+                自己的输入区。那三个动作与状态现在都在窗口上边那枚切换器上（见 WorkbenchSwitcherView），
+                镜像区域里不再有任何我们画的浮层。 */}
           </>
         )}
-        {busy !== undefined ? <div className="drd-float-note">正在{active.phase === 'starting' ? '启动' : '处理'}…</div> : null}
       </div>
     )
   }
@@ -1177,6 +1142,7 @@ export function PanelView(props: PanelViewProps): ReactNode {
                   label={active.label}
                   preference={preference}
                   services={props}
+                  showNote={true}
                   onNote={(value) => {
                     carrierNoteRef.current = value
                   }}
@@ -1358,10 +1324,34 @@ function useReserveSpace(
 }
 
 /**
+ * 我们在不在"别人家的页面"里。
+ *
+ * 镜像出来的 DSH 就是**同一个应用**，因此它自己也会加载本插件的客户端 bundle——不拦住的话，
+ * 镜像区域里会再画一枚一模一样的「本机」切换器（用户截图里上下两个"本机"就是这么来的）。
+ * 顶层窗口（`self === top`）才画浮层，被嵌在 iframe 里就什么都不画。
+ *
+ * 参数化是为了能在没有浏览器的冒烟测试里直接验（传 `{self, top}` 这种假 window）。
+ */
+export function inNestedFrame(view?: { self?: unknown; top?: unknown }): boolean {
+  const target = view ?? (typeof window === 'undefined' ? undefined : window)
+  if (target === undefined) return false
+  try {
+    return target.self !== target.top
+  } catch {
+    // 跨域读 top 会抛，那本身就说明我们在别人的 frame 里。
+    return true
+  }
+}
+
+/**
  * 切换器本体：**纯渲染**。
  *
  * 选中某一项 = ①记下选中 ②把它跑起来（本机那一项是吸附，不拉新进程）③把主区切到本面板，
  * 于是"选 WSL 就连 WSL 的服务端口"这件事在一次点击里完成。
+ *
+ * 除了选机器，这条还兼任了原来那条右下角浮条的活：状态、全窗口、重载、管理。
+ * 它贴在窗口上边（桌面版钻进标题栏那条带子、纯 Web 外壳贴在帧级浮层线上），镜像区域里
+ * 一个我们画的东西都不剩——用户要的就是"别挡着远端界面"。
  */
 export function WorkbenchSwitcherView({
   store,
@@ -1380,11 +1370,17 @@ export function WorkbenchSwitcherView({
   const [busy, setBusy] = useState(false)
   const [note, setNote] = useState<string>('')
   const rootRef = useRef<HTMLDivElement | null>(null)
-  const visible = config.enabled && instances.length > 0 && active !== undefined
+  const nested = inNestedFrame()
+  const visible = config.enabled && instances.length > 0 && active !== undefined && !nested
   const placement = useSwitcherPlacement(config, rootRef, visible)
   useReserveSpace(config, rootRef, visible && placement.band === 'content')
 
   if (!visible || active === undefined) return null
+
+  const running = active.phase === 'running'
+  const carrier = store.carrierNotes[active.id]
+  const carrierProblem = carrierNoteIsProblem(carrier)
+  const mode = layoutModeOf(store)
 
   const onChange = (id: string): void => {
     actions.select(id)
@@ -1432,6 +1428,40 @@ export function WorkbenchSwitcherView({
       <span className="drd-meta" title={longStatus(active)}>
         {busy ? '连接中' : note !== '' ? '失败' : shortStatus(active)}
       </span>
+      {/* 载体出问题（降级/退回/空白）才在这里亮一个 `!`，悬停看原因；正常用 iframe 不必天天提醒。 */}
+      {carrierProblem ? (
+        <span className="drd-flag" title={carrier} aria-label={carrier}>
+          !
+        </span>
+      ) : null}
+      {running ? (
+        <>
+          <button
+            type="button"
+            className="drd-btn"
+            title="收起应用侧栏，让这台机器的界面占满整扇窗（再点一次展开）"
+            onClick={() => services.layout?.toggleSidebar?.()}
+          >
+            全窗口
+          </button>
+          <button
+            type="button"
+            className="drd-btn"
+            title="把这台机器的镜像载体重挂一遍（卡住、或想重走一遍票据时用）"
+            onClick={() => bumpReload(active.id)}
+          >
+            重载
+          </button>
+        </>
+      ) : null}
+      <button
+        type="button"
+        className="drd-btn"
+        title={mode === 'immersive' ? '显示实例列表、工具栏与日志' : '回到那台机器的界面'}
+        onClick={() => setLayoutMode(mode === 'immersive' ? 'manage' : 'immersive')}
+      >
+        {mode === 'immersive' ? '管理' : '统一界面'}
+      </button>
       {note === '' ? null : (
         <span className="drd-meta" style={{ color: 'var(--dsw-alias-state-error-primary, inherit)' }} title={note}>
           {note.slice(0, 60)}
